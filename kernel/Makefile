@@ -34,6 +34,7 @@
 #   FEATURES = profile | ...    Add additional features
 
 ARCH ?= riscv64
+export ARCH
 MODE ?= release
 LOG  ?=
 GRAPHIC ?= off
@@ -256,8 +257,8 @@ endif
 gdb := gdb
 sysroot := $(shell rustc --print sysroot)
 objdump := $(shell find $(sysroot) -name llvm-objdump) -print-imm-hex
-objcopy := $(shell find $(sysroot) -name llvm-objcopy)
-strip := $(shell find $(sysroot) -name llvm-strip)
+objcopy := $(shell find $(sysroot) -name llvm-objcopy -o -name rust-objcopy | head -1)
+strip := $(shell find $(sysroot) -name llvm-strip -o -name rust-strip | head -1)
 dtc := dtc
 hostcc := gcc
 
