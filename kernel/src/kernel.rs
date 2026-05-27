@@ -2197,7 +2197,7 @@ impl Channel {
                 continue;
             }
             break;
-        }
+        } //获取自旋锁
         let result = {
             let mut ring = self.buf.lock().unwrap();
             if ring.n > 0 {
@@ -2213,15 +2213,15 @@ impl Channel {
             } else {
                 None
             }
-        };
+        }; //尝试从缓冲区读取数据
         if result.is_some() {
             self.guard.v.store(false, Ordering::Release);
             return result;
-        }
+        } //如果读到了就释放自旋锁并返回
         if self.shut.load(Ordering::Relaxed) {
             self.guard.v.store(false, Ordering::Release);
             return None;
-        }
+        } //如果通道关闭就释放guard并返回
         {
             let data_ref = &self.buf;
             {
@@ -2230,10 +2230,18 @@ impl Channel {
                     drop(d);
                 } else {
                     drop(d);
+                    self.guard.v.store(false, Ordering::Release); //HUMAN：睡眠时不能占着自旋锁
                     let mut wq = self.wq.q.lock().unwrap();
                     wq.push_back(thread::current());
                     drop(wq);
                     thread::park();
+                    loop {
+                        if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                            core::hint::spin_loop();
+                            continue;
+                        }
+                        break;
+                    } //HUMAN：之前补上了睡眠前释放自旋锁，因此这里也要重新获取自旋锁
                 }
             }
         }
