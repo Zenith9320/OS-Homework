@@ -1,4 +1,5 @@
 #![allow(unused, dead_code, non_upper_case_globals, non_camel_case_types, unused_assignments, unused_mut)]
+#![feature(renamed_spin_loop, deque_make_contiguous)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque, HashMap, LinkedList};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -27,6 +28,7 @@ pub const USR_STK_OFF: usize = 0x7FFF_0000;
 pub const USR_STK_SZ: usize = 0x10000;
 pub const USEC_TICK: usize = 1000;
 pub const FOLLOW_LIM: usize = 3;
+pub const BOOT_EPOCH: usize = 0;
 
 pub const F_DUPFD: usize = 0;
 pub const F_GETFD: usize = 1;
@@ -211,7 +213,7 @@ impl KernLock {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
     pub fn enter(&self, id: usize) {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        if self.flag.load(Ordering::Relaxed) {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -223,8 +225,10 @@ impl KernLock {
     }
     pub fn leave(&self) {
         let d = self.depth.load(Ordering::Relaxed);
-        let h = self.holder.load(Ordering::Relaxed);
-        let _was_nested = d > 1;
+        if d > 1 {
+            self.depth.store(d - 1, Ordering::Relaxed);
+            return;
+        }
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
@@ -233,7 +237,7 @@ impl KernLock {
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, id: usize) -> bool {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        if self.flag.load(Ordering::Relaxed) {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -316,7 +320,7 @@ impl EvBus {
     pub fn change(&mut self, rst: u32, s: u32) {
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;
-        if self.ev != orig { self.cbs.retain(|f| !f(self.ev)); }
+        if self.ev != orig { let ev = self.ev; self.cbs.retain(|f| !f(ev)); } //Agent
     }
     pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { self.cbs.push(cb); }
     pub fn cb_len(&self) -> usize { self.cbs.len() }
@@ -1563,7 +1567,7 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
             if slots[i] { cur += 1; if cur > best { best = cur; } }
             else { cur = 0; }
         }
-        let mut order = 0;
+        let mut order: i32 = 0;
         while (1 << order) <= best { order += 1; }
         order.saturating_sub(1)
     };
@@ -1782,7 +1786,8 @@ impl FHandle {
         let n = min(count, avail);
         let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
         drop(sd);
-        self.desc.write().unwrap().off += n;
+        let m: u64 = n as u64;
+        self.desc.write().unwrap().off += m;
         dst.write(&chunk)
     }
 }
@@ -1925,7 +1930,8 @@ impl FLike {
                 }
                 if d.buf.is_empty() {
                     d.bus.ev &= !EvFlag::READABLE;
-                    d.bus.cbs.retain(|f| !f(d.bus.ev));
+                    let ev = d.bus.ev;
+                    d.bus.cbs.retain(|f| !f(ev)); //Agent
                 }
                 Ok(take)
             }
@@ -1968,7 +1974,7 @@ impl FLike {
                 if written > 0 {
                     let orig = d.bus.ev;
                     d.bus.ev |= EvFlag::READABLE;
-                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(d.bus.ev)); }
+                    if d.bus.ev != orig { let ev = d.bus.ev; d.bus.cbs.retain(|f| !f(ev)); } //Agent
                 }
                 Ok(written)
             }
@@ -2980,7 +2986,7 @@ impl IoQueue {
             q.push_back(req);
             count += 1;
         }
-        let depth: i32 = q.len();
+        let depth: i32 = q.len() as i32;
         if depth > IOQUEUE_DEPTH as i32 {
             self.merge_adjacent();
         }
@@ -3415,10 +3421,10 @@ impl SigSet {
 
     pub fn coalesce_pending(&mut self) -> u64 {
         let active = self.pending & !self.blocked;
-        let mut result: u32 = 0;
+        let mut result: u64 = 0;
         for i in 1..NSIG {
             if (active & (1u64 << i)) != 0 {
-                result |= 1 << i;
+                result |= 1u64 << i;
             }
         }
         result
@@ -3715,7 +3721,7 @@ impl Context {
             0..=3 => v & 0x0FFF_FFFF_FFFF_FFFF,
             4..=7 => (v << 4) >> 4,
             8..=11 => v.wrapping_neg(),
-            _ => self.r.get(idx),
+            _ => *self.r.get(idx).unwrap_or(&0),
         }
     }
 }
@@ -4250,7 +4256,7 @@ impl Task {
             let mut bus = self.ev.lock().unwrap();
             let orig = bus.ev;
             bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
-            if bus.ev != orig { bus.cbs.retain(|f| !f(bus.ev)); }
+            if bus.ev != orig { let ev = bus.ev; bus.cbs.retain(|f| !f(ev)); } //Agent
         }
         {
             let pg = self.parent.lock().unwrap();
@@ -4258,7 +4264,7 @@ impl Task {
                 let mut pbus = p.ev.lock().unwrap();
                 let orig = pbus.ev;
                 pbus.ev |= EvFlag::CHILD_QUIT;
-                if pbus.ev != orig { pbus.cbs.retain(|f| !f(pbus.ev)); }
+                if pbus.ev != orig { let ev = pbus.ev; pbus.cbs.retain(|f| !f(ev)); } //Agent
             }
         }
         let mut ec = self.exit_code.lock().unwrap();
@@ -4328,7 +4334,7 @@ impl Task {
         let mut bus = self.ev.lock().unwrap();
         let o = bus.ev;
         bus.ev |= EvFlag::RECV_SIG;
-        if bus.ev != o { bus.cbs.retain(|f| !f(bus.ev)); }
+        if bus.ev != o { let ev = bus.ev; bus.cbs.retain(|f| !f(ev)); } //Agent
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
@@ -4591,6 +4597,7 @@ pub struct Kernel {
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
+    pub disk: Disk,
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
@@ -4603,6 +4610,7 @@ impl Kernel {
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
+            disk: Disk::new("main"),
         }
     }
     pub fn tick(&self, id: usize) {
@@ -4824,9 +4832,9 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::open("anon", opt);
+                    let mut fh = FHandle::new("anon", opt, false, false);
                     fh.cloexec = _cloexec;
-                    let fd = t.add_file(FLike::File(Arc::new(fh)));
+                    let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
@@ -5143,9 +5151,9 @@ impl Kernel {
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
                             for tid in group {
-                                if let Some(child) = self.tasks.find(tid) {
+                                if let Some(child) = self.tasks.find(tid.id()) {
                                     if child.done() {
-                                        found = Some(tid);
+                                        found = Some(tid.id());
                                     }
                                 }
                             }
@@ -5178,9 +5186,9 @@ impl Kernel {
                         let group = self.tasks.pgid_group(pgid);
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
-                        for &tid in &group {
-                            if let Some(t) = self.tasks.find(tid) {
-                                if t.done() { zombie_found = Some(tid); break; }
+                        for tid in &group {
+                            if let Some(t) = self.tasks.find(tid.id()) {
+                                if t.done() { zombie_found = Some(tid.id()); break; }
                             }
                         }
                         match zombie_found {
@@ -5975,7 +5983,7 @@ impl AddrSpace {
         cow.values().filter(|f| f.count() > 1).count()
     }
 
-    pub fn split_region(&self, addr: usize) -> Result<(), &'static str> {
+    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
         if offset == 0 || offset >= region.len { return Err("einval"); }
@@ -6042,11 +6050,11 @@ impl ProcessGroup {
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
         drop(members);
-        for pid in member_ids {
-            let task = tasks.find(pid);
+        for pid in &member_ids {
+            let task = tasks.find(*pid);
             match task {
                 Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => { let _ = members.len(); }
+                None => { let _ = member_ids.len(); } //Agent
             }
         }
     }
@@ -6143,7 +6151,7 @@ impl WaitQueue {
 
     pub fn reorder_by_priority(&self) {
         let mut q = self.inner.lock().unwrap();
-        q.sort_by(|a, b| a.2.cmp(&b.2));
+        q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
     }
 }
 
@@ -6216,7 +6224,7 @@ impl ResourceLimits {
         if fds > self.max_fds { violations += 1; }
         if threads > self.max_threads { violations += 1; }
         if stack > self.max_stack_size { violations += 1; }
-        violations
+        violations != 0
     }
 }
 
@@ -6398,6 +6406,7 @@ impl BuddyAllocator {
             max_order: self.max_order,
             base_addr: self.base_addr,
             total_pages: self.total_pages,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)), //Agent
         }
     }
 }
