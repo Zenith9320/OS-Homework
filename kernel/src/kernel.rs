@@ -213,7 +213,7 @@ impl KernLock {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
     pub fn enter(&self, id: usize) {
-        if self.flag.load(Ordering::Relaxed) {
+        if self.flag.load(Ordering::Relaxed) { //HUMAN
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -228,7 +228,7 @@ impl KernLock {
         if d > 1 {
             self.depth.store(d - 1, Ordering::Relaxed);
             return;
-        }
+        } //HUMAN
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
@@ -237,7 +237,7 @@ impl KernLock {
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, id: usize) -> bool {
-        if self.flag.load(Ordering::Relaxed) {
+        if self.flag.load(Ordering::Relaxed) { //HUMAN
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
