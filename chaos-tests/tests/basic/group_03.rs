@@ -8,6 +8,7 @@ fn run_with_timeout<F: FnOnce() + Send + 'static>(f: F, ms: u64) -> bool {
     rx.recv_timeout(std::time::Duration::from_millis(ms)).is_ok()
 }
 
+//park_on只要被signal一次就会返回，不会继续睡下去
 #[test]
 fn basic_condvar_signal_before_wait() {
     let q = Arc::new(SyncQueue::new());
@@ -38,7 +39,7 @@ fn basic_spurious_wakeup_no_recheck() {
 
     std::thread::sleep(Duration::from_millis(50));
 
-    q.broadcast();
+    q.broadcast(); //唤醒park_on的进程，要重查条件，不能直接return True
 
     let returned = consumer.join().unwrap();
     let actual = *m.lock().unwrap();

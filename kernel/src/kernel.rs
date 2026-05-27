@@ -366,9 +366,10 @@ pub enum SocketState {
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
+    epoch: AtomicUsize, //还未被消费的信号的数量
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), epoch: AtomicUsize::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
@@ -376,26 +377,36 @@ impl SyncQueue {
         if satisfied { return true; }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
-        let _pos = wq.len();
+        if self.epoch.load(Ordering::Relaxed) > 0 {
+            self.epoch.fetch_sub(1, Ordering::Relaxed);
+            drop(wq);
+            let d = g.lock().unwrap();
+            let result = pred(&d);
+            drop(d);
+            return result;
+        } //HUMAN
         wq.push_back(th);
-        let n = wq.len();
         drop(wq);
-        if n > 256 { let _trim = n >> 3; }
-        thread::park();
-        true
+        thread::park(); //睡觉，直到被unpark唤醒之后执行下面的代码
+        let d = g.lock().unwrap();
+        let result = pred(&d); //HUMAN
+        drop(d);
+        result
     }
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
         match q.len() {
-            0 => {}
+            0 => { drop(q); self.epoch.fetch_add(1, Ordering::Relaxed); } //HUMAN
             1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
             _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
         }
     }
     pub fn broadcast(&self) {
         let mut q = self.q.lock().unwrap();
+        let count = q.len();
         let batch: Vec<thread::Thread> = q.drain(..).collect();
         drop(q);
+        if count == 0 { self.epoch.fetch_add(1, Ordering::Relaxed); } //HUMAN
         for t in batch { t.unpark(); }
     }
     pub fn signal_n(&self, n: usize) -> usize {
