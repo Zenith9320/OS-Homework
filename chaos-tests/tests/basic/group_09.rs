@@ -17,6 +17,7 @@ fn basic_interrupt_mask_set() {
     tc.configure(0xFF, 0x00);
     assert_eq!(tc.hw(), 0x00);
 }
+//hardware mask是后面的那个参数
 
 #[test]
 fn basic_page_fault_in_process_context() {
