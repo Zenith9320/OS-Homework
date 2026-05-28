@@ -3067,7 +3067,7 @@ impl IoQueue {
 }
 
 pub struct Disk {
-    pub errs: AtomicUsize,
+    pub errs: AtomicUsize, //模拟故障，前errs次对磁盘的操作会报错
     pub ops: AtomicUsize,
     pub label: String,
     pub journal: Option<Arc<Disk>>,
@@ -3088,9 +3088,7 @@ impl Disk {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
-                let mut i = 0;
-                while i < buf_len { out[i] = fill.wrapping_add(i as u8); i += 1; }
+                for b in out.iter_mut() { *b = 0xAA; }  //HUMAN
                 return Ok(());
             }
             let persistent = rem == usize::MAX;
