@@ -213,7 +213,7 @@ impl KernLock {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
     pub fn enter(&self, id: usize) {
-        if self.flag.load(Ordering::Relaxed) { //HUMAN
+        if self.holder.load(Ordering::Relaxed) == id && id != 0 { //HUMAN
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -237,7 +237,7 @@ impl KernLock {
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, id: usize) -> bool {
-        if self.flag.load(Ordering::Relaxed) { //HUMAN
+        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -968,9 +968,9 @@ pub struct FramePool {
 impl FramePool {
     pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
     pub fn get(&self, id: usize) -> Option<usize> {
-        GKL.enter(id);
+        //HUMAN: GKL.enter(id);
         let r = self.get_inner();
-        GKL.leave();
+        //HUMAN: GKL.leave();
         r
     }
     pub fn get_inner(&self) -> Option<usize> {
