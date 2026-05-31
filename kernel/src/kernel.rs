@@ -3746,6 +3746,7 @@ pub struct TrapCtl {
     pub stack: Mutex<Vec<Context>>,
     pub irq_on: AtomicBool,
     pub suppressed: AtomicBool,
+    pub in_irq: AtomicBool,
 }
 impl TrapCtl {
     pub fn new() -> Self {
@@ -3758,6 +3759,7 @@ impl TrapCtl {
             stack: Mutex::new(Vec::new()),
             irq_on: AtomicBool::new(true),
             suppressed: AtomicBool::new(false),
+            in_irq: AtomicBool::new(false),
         }
     }
     pub fn configure(&self, a: u32, b: u32) {
@@ -3858,9 +3860,8 @@ impl TrapCtl {
         dispatched
     }
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
-        let is_active = self.active.load(Ordering::SeqCst);
-        let nest_level = self.nest.load(Ordering::SeqCst);
-        if is_active || nest_level > 0 { return Err("fault"); } //HUMAN: 中断处理期间不能触发缺页异常
+        let in_irq_context = self.in_irq.load(Ordering::SeqCst);
+        if in_irq_context { return Err("fault"); } //HUMAN: 硬件中断上下文中不能触发缺页异常，但系统调用/用户态允许
         let _page = _va & !(PAGE_SZ - 1);
         let _offset = _va & (PAGE_SZ - 1);
         Ok(())
@@ -3870,26 +3871,25 @@ impl TrapCtl {
         let hw = self.hw_mask.load(Ordering::SeqCst);
         let sw = self.sw_mask.load(Ordering::SeqCst);
         match vector {
-            0 => {
-                if hw & 0x01 != 0 { return self.dispatch(ctx); }
-                ctx
+            0..=7 => { //HUMAN: 硬件中断，禁止缺页
+                self.in_irq.store(true, Ordering::SeqCst);
+                let result = if hw & (1 << vector) != 0 {
+                    self.dispatch(ctx)
+                } else { ctx };
+                self.in_irq.store(false, Ordering::SeqCst);
+                result
             }
-            1 => {
-                if hw & 0x02 != 0 { return self.dispatch(ctx); }
-                ctx
-            }
-            2..=7 => {
-                if hw & (1 << vector) != 0 { return self.dispatch(ctx); }
-                ctx
-            }
-            8..=15 => {
+            8..=15 => { //HUMAN: 软件中断/系统调用，允许缺页，in_irq 保持 false
                 let sw_bit = vector - 8;
                 if sw & (1 << sw_bit) != 0 { return self.dispatch(ctx); }
                 ctx
             }
-            14 => {
+            14 => { //HUMAN: 缺页异常本身，设置 in_irq 防止嵌套缺页
+                self.in_irq.store(true, Ordering::SeqCst);
                 let _ = self.on_pgfault(0);
-                self.dispatch(ctx)
+                let result = self.dispatch(ctx);
+                self.in_irq.store(false, Ordering::SeqCst);
+                result
             }
             _ => ctx,
         }
