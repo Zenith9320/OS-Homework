@@ -33,6 +33,13 @@ jobs:
         rustup toolchain install nightly-2020-06-04 --component rust-src --component llvm-tools-preview
         rustup override set nightly-2020-06-04
 
+    - name: Install dependencies
+      if: runner.os == 'Linux'
+      run: sudo apt install -y device-tree-compiler libglib2.0-dev pkg-config libpixman-1-dev
+    - name: Install dependencies
+      if: runner.os == 'macOS'
+      run: brew install dtc
+
     - name: Cache QEMU
       if: runner.os == 'Linux'
       uses: actions/cache@v4
@@ -47,13 +54,6 @@ jobs:
     - name: Install QEMU
       if: runner.os == 'macOS'
       run: brew install qemu
-
-    - name: Install dependencies
-      if: runner.os == 'Linux'
-      run: sudo apt install -y device-tree-compiler libglib2.0-dev pkg-config libpixman-1-dev
-    - name: Install dependencies
-      if: runner.os == 'macOS'
-      run: brew install dtc
 
     - name: Download prebuilt user image
       run: cd user && make sfsimg ARCH=${{ matrix.arch }} PREBUILT=1 && cd ..
