@@ -55,11 +55,13 @@ jobs:
     - name: Download prebuilt user image
       run: cd user && make sfsimg ARCH=${{ matrix.arch }} PREBUILT=1 && cd ..
 
+    - name: Install stable Rust
+      run: rustup toolchain install stable --profile minimal
+    - name: Fetch cargo dependencies
+      run: cd kernel && cargo +stable fetch
+
     - name: Build kernel
-      run: |
-        rm -rf ~/.cargo/registry/index/github.com-* ~/.cargo/registry/cache/github.com-* || true
-        cd kernel && (make build ARCH=${{ matrix.arch }} || make build ARCH=${{ matrix.arch }})
-      shell: bash
+      run: cd kernel && make build ARCH=${{ matrix.arch }}
 
     - name: Build kernel with hypervisor
       if: runner.os == 'Linux' && matrix.arch == 'x86_64'
