@@ -39,6 +39,9 @@ jobs:
       with:
         path: qemu-4.2.0
         key: ${{ runner.os }}-${{ matrix.arch }}-qemu
+    - name: Install dependencies
+      if: runner.os == 'Linux'
+      run: sudo apt install -y device-tree-compiler libglib2.0-dev libpixman-1-dev pkg-config
     - name: Install QEMU
       if: runner.os == 'Linux'
       run: |
@@ -48,9 +51,6 @@ jobs:
       if: runner.os == 'macOS'
       run: brew install qemu
 
-    - name: Install dependencies
-      if: runner.os == 'Linux'
-      run: sudo apt install -y device-tree-compiler libglib2.0-dev libpixman-1-dev pkg-config
     - name: Install dependencies
       if: runner.os == 'macOS'
       run: brew install dtc
