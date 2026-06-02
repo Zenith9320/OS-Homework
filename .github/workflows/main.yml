@@ -61,6 +61,8 @@ jobs:
       run: cd kernel && cargo +stable fetch
 
     - name: Build kernel
+      env:
+        CARGO_NET_OFFLINE: "true"
       run: cd kernel && make build ARCH=${{ matrix.arch }}
 
     - name: Build kernel with hypervisor
