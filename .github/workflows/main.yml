@@ -57,9 +57,8 @@ jobs:
 
     - name: Build kernel
       run: |
-        rm -rf ~/.cargo/registry/cache/github.com-* || true
-        cd kernel && make build ARCH=${{ matrix.arch }} || \
-        cd kernel && make build ARCH=${{ matrix.arch }}
+        rm -rf ~/.cargo/registry/index/github.com-* ~/.cargo/registry/cache/github.com-* || true
+        cd kernel && (make build ARCH=${{ matrix.arch }} || make build ARCH=${{ matrix.arch }})
       shell: bash
 
     - name: Build kernel with hypervisor
