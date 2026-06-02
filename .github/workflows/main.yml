@@ -6,36 +6,36 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
       with:
-        profile: minimal
         toolchain: nightly-2020-06-04
-        override: true
         components: rustfmt, clippy
+    - name: Install rustfmt
+      run: rustup component add rustfmt --toolchain nightly-2020-06-04
     - name: Check code format
       run: cd kernel && cargo fmt -- --check
 
   build:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         # we will bring back mipsel later
         arch: [x86_64, riscv32, riscv64, aarch64, mipsel]
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Checkout submodules
       run: git submodule update --init --recursive
-    - uses: actions-rs/toolchain@v1
+    - uses: dtolnay/rust-toolchain@master
       with:
-        profile: minimal
         toolchain: nightly-2020-06-04
         components: rust-src, llvm-tools-preview
 
     - name: Cache QEMU
       if: runner.os == 'Linux'
-      uses: actions/cache@v1
+      uses: actions/cache@v4
       with:
         path: qemu-4.2.0
         key: ${{ runner.os }}-${{ matrix.arch }}-qemu
