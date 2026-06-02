@@ -1,0 +1,32 @@
+build
+target
+/kernel/src/arch/x86_64/interrupt/vector.asm
+/kernel/src/arch/mipsel/boot/linker.ld
+*.gen.s
+*.dtb
+
+Cargo.lock
+!kernel/Cargo.lock
+!bootloader/Cargo.lock
+!user/Cargo.lock
+
+.DS_Store
+
+# for eclipse
+.project
+
+# for vscode
+.vscode
+
+# for vim
+*.swp
+
+# for idea
+.idea
+
+# for kernel module building
+# C & Rust
+modules/*/objs
+# Rust
+modules/*/target
+test/

@@ -1,0 +1,21 @@
+[package]
+name = "chaos-tests"
+version = "0.1.0"
+edition = "2018"
+description = "Test suite for the Chaos Monolith Kernel debugging exercise"
+
+[dependencies]
+
+[dev-dependencies]
+
+[[test]]
+name = "basic"
+path = "tests/basic/main.rs"
+
+[[test]]
+name = "advanced"
+path = "tests/advanced/main.rs"
+
+[[test]]
+name = "pressure"
+path = "tests/pressure/main.rs"
