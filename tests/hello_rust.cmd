@@ -1,1 +1,0 @@
-rust/hello_rust
