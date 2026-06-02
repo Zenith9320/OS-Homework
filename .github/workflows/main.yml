@@ -50,7 +50,7 @@ jobs:
 
     - name: Install dependencies
       if: runner.os == 'Linux'
-      run: sudo apt install -y device-tree-compiler
+      run: sudo apt install -y device-tree-compiler libglib2.0-dev libpixman-1-dev pkg-config
     - name: Install dependencies
       if: runner.os == 'macOS'
       run: brew install dtc
