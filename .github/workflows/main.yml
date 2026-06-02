@@ -35,22 +35,21 @@ jobs:
 
     - name: Install dependencies
       if: runner.os == 'Linux'
-      run: sudo apt install -y device-tree-compiler libglib2.0-dev pkg-config libpixman-1-dev
+      run: sudo apt install -y device-tree-compiler
     - name: Install dependencies
       if: runner.os == 'macOS'
       run: brew install dtc
 
-    - name: Cache QEMU
-      if: runner.os == 'Linux'
-      uses: actions/cache@v4
-      with:
-        path: qemu-4.2.0
-        key: ${{ runner.os }}-${{ matrix.arch }}-qemu
     - name: Install QEMU
       if: runner.os == 'Linux'
       run: |
-        [ ! -d qemu-4.2.0 ] && wget https://download.qemu.org/qemu-4.2.0.tar.xz && tar xJf qemu-4.2.0.tar.xz > /dev/null
-        cd qemu-4.2.0 && ./configure --target-list=${{ matrix.arch }}-softmmu && sudo make install -j $(nproc) && cd ..
+        case "${{ matrix.arch }}" in
+          x86_64)           PKG=qemu-system-x86 ;;
+          riscv32|riscv64)  PKG=qemu-system-riscv ;;
+          aarch64)          PKG=qemu-system-arm ;;
+          mipsel)           PKG=qemu-system-mips ;;
+        esac
+        sudo apt install -y $PKG
     - name: Install QEMU
       if: runner.os == 'macOS'
       run: brew install qemu
