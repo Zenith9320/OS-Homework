@@ -43,14 +43,14 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         [ ! -d qemu-4.2.0 ] && wget https://download.qemu.org/qemu-4.2.0.tar.xz && tar xJf qemu-4.2.0.tar.xz > /dev/null
-        cd qemu-4.2.0 && ./configure --target-list=${{ matrix.arch }}-softmmu && sudo make install -j && cd ..
+        cd qemu-4.2.0 && ./configure --target-list=${{ matrix.arch }}-softmmu && sudo make install -j $(nproc) && cd ..
     - name: Install QEMU
       if: runner.os == 'macOS'
       run: brew install qemu
 
     - name: Install dependencies
       if: runner.os == 'Linux'
-      run: sudo apt install -y device-tree-compiler
+      run: sudo apt install -y device-tree-compiler libglib2.0-dev pkg-config libpixman-1-dev
     - name: Install dependencies
       if: runner.os == 'macOS'
       run: brew install dtc
