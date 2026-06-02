@@ -28,6 +28,12 @@ jobs:
     - uses: actions/checkout@v4
     - name: Checkout submodules
       run: git submodule update --init --recursive
+    - name: Install rcore-fs-fuse
+      run: |
+        rm -rf ~/.cargo/git/db/rcore-fs-* || true
+        cargo install rcore-fs-fuse --git https://github.com/rcore-os/rcore-fs --rev 7f5eeac --force || \
+        cargo install rcore-fs-fuse --git https://github.com/rcore-os/rcore-fs --rev 7f5eeac --force
+
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: nightly-2020-06-04
@@ -45,12 +51,6 @@ jobs:
     - name: Install dependencies
       if: runner.os == 'macOS'
       run: brew install dtc
-
-    - name: Install rcore-fs-fuse
-      run: |
-        rm -rf ~/.cargo/git/db/rcore-fs-* || true
-        cargo install rcore-fs-fuse --git https://github.com/rcore-os/rcore-fs --rev 7f5eeac --force || \
-        cargo install rcore-fs-fuse --git https://github.com/rcore-os/rcore-fs --rev 7f5eeac --force
 
     - name: Download prebuilt user image
       run: cd user && make sfsimg ARCH=${{ matrix.arch }} PREBUILT=1 && cd ..
