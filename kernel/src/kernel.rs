@@ -579,7 +579,7 @@ impl FutexBucket {
 }
 
 pub struct FutexTable {
-    table: Mutex<VecDeque<(usize, thread::Thread)>>,
+    table: Mutex<VecDeque<(usize, thread::Thread)>>, //(等待的锁的地址，线程)
 }
 
 impl FutexTable {
@@ -594,19 +594,20 @@ impl FutexTable {
         true
     }
 
+    //根据释放的锁的地址唤醒线程
     pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
-        let mut wq = self.table.lock().unwrap();
-        let target = addr;
+        let mut wq = self.table.lock().unwrap(); //Waiting queue
+        let target = addr; //释放出来的锁的地址
         let limit = count;
         let mut wk = 0usize;
         let mut cursor = 0;
         let total = wq.len();
         while cursor < wq.len() && wk <= limit {
-            if wq[cursor].0 == target {
+            if wq[cursor].0 == target { 
                 wk += 1;
                 if wk < limit {
                     let entry = wq.remove(cursor).unwrap();
-                    entry.1.unpark();
+                    entry.1.unpark();//唤醒线程
                 } else {
                     cursor += 1;
                 }
@@ -2240,11 +2241,12 @@ impl Channel {
                     drop(d);
                 } else {
                     drop(d);
-                    self.guard.v.store(false, Ordering::Release); //HUMAN：睡眠时不能占着自旋锁
                     let mut wq = self.wq.q.lock().unwrap();
                     wq.push_back(thread::current());
                     drop(wq);
+                    self.guard.v.store(false, Ordering::Release); //HUMAN：睡眠时不能占着自旋锁
                     thread::park();
+                    //释放自旋锁到把自己推入wq的间隙中可能会有send函数刚好发送完成，要先入队再能释放锁
                     loop {
                         if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
                             core::hint::spin_loop();
@@ -4780,7 +4782,7 @@ impl Kernel {
                 } else {
                     let full_pages = (count - remaining_in_page) / PAGE_SZ;
                     let tail = (count - remaining_in_page) % PAGE_SZ;
-                    remaining_in_page + full_pages * PAGE_SZ + tail + page_off
+                    remaining_in_page + full_pages * PAGE_SZ + tail //HUMAN：delete + page_off，实际上最后算出来就是count
                 };
                 let ci = fd % self.cache.width;
                 let ch = &self.cache.chains[ci];
@@ -5461,7 +5463,7 @@ impl Kernel {
                 let act_addr = a1;
                 let oldact_addr = a2;
                 if signo == 0 || signo >= NSIG as usize { return Err("einval"); }
-                if signo != SIGKILL as usize && signo != SIGSTOP as usize { return Err("einval"); }
+                if signo == SIGKILL as usize || signo == SIGSTOP as usize { return Err("einval"); } //HUMAN
                 if act_addr != 0 && !check_access(act_addr, 32) { return Err("efault"); }
                 if oldact_addr != 0 && !check_access(oldact_addr, 32) { return Err("efault"); }
                 let _sa_flags = if act_addr != 0 { a3 & 0xFFFF } else { 0 };
