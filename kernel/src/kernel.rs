@@ -214,7 +214,7 @@ impl KernLock {
     }
     pub fn enter(&self, id: usize) {
         eprintln!("[DBG] KernLock::enter");
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 { //HUMAN
+        if self.holder.load(Ordering::Relaxed) != 0 && id != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1076,9 +1076,9 @@ impl FramePool {
         Self { slots: Mutex::new(vec![true; n]), cap: n } }
     pub fn get(&self, id: usize) -> Option<usize> {
         eprintln!("[DBG] FramePool::get");
-        //HUMAN: GKL.enter(id);
+        GKL.enter(id);
         let r = self.get_inner();
-        //HUMAN: GKL.leave();
+        GKL.leave();
         r
     }
     pub fn get_inner(&self) -> Option<usize> {
@@ -3029,9 +3029,14 @@ impl BlockCache {
             }
             ch.lk.v.store(false, Ordering::Release);
         }
-        GKL.holder.store(0, Ordering::Relaxed);
-        GKL.depth.store(0, Ordering::Relaxed);
-        GKL.flag.store(false, Ordering::Release);
+        let d = GKL.depth.load(Ordering::Relaxed);
+        if d > 1 {
+            GKL.depth.store(d - 1, Ordering::Relaxed);
+        } else {
+            GKL.holder.store(0, Ordering::Relaxed);
+            GKL.depth.store(0, Ordering::Relaxed);
+            GKL.flag.store(false, Ordering::Release);
+        }
     }
 
     pub fn invalidate(&self, k: usize) {
@@ -5153,9 +5158,14 @@ impl Kernel {
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
-        GKL.holder.store(0, Ordering::Relaxed);
-        GKL.depth.store(0, Ordering::Relaxed);
-        GKL.flag.store(false, Ordering::Release);
+        let d = GKL.depth.load(Ordering::Relaxed);
+        if d > 1 {
+            GKL.depth.store(d - 1, Ordering::Relaxed);
+        } else {
+            GKL.holder.store(0, Ordering::Relaxed);
+            GKL.depth.store(0, Ordering::Relaxed);
+            GKL.flag.store(false, Ordering::Release);
+        }
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         eprintln!("[DBG] Kernel::cur_task");
