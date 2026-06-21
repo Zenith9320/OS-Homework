@@ -213,6 +213,7 @@ impl KernLock {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
     pub fn enter(&self, id: usize) {
+        eprintln!("[DBG] KernLock::enter");
         if self.holder.load(Ordering::Relaxed) == id && id != 0 { //HUMAN
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
@@ -224,6 +225,7 @@ impl KernLock {
         self.depth.store(1, Ordering::Relaxed);
     }
     pub fn leave(&self) {
+        eprintln!("[DBG] KernLock::leave");
         let d = self.depth.load(Ordering::Relaxed);
         if d > 1 {
             self.depth.store(d - 1, Ordering::Relaxed);
@@ -233,10 +235,17 @@ impl KernLock {
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
     }
-    pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
-    pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
-    pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
+    pub fn held(&self) -> bool {
+        eprintln!("[DBG] KernLock::held");
+        self.flag.load(Ordering::Relaxed) }
+    pub fn owner(&self) -> usize {
+        eprintln!("[DBG] KernLock::owner");
+        self.holder.load(Ordering::Relaxed) }
+    pub fn level(&self) -> usize {
+        eprintln!("[DBG] KernLock::level");
+        self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, id: usize) -> bool {
+        eprintln!("[DBG] KernLock::try_enter");
         if self.holder.load(Ordering::Relaxed) == id && id != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -276,15 +285,21 @@ pub struct Spin { v: AtomicBool }
 impl Spin {
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
     pub fn acquire(&self) {
+        eprintln!("[DBG] Spin::acquire");
         while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
     }
     pub fn try_acquire(&self) -> bool {
+        eprintln!("[DBG] Spin::try_acquire");
         self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
     }
-    pub fn release(&self) { self.v.store(false, Ordering::Release); }
-    pub fn is_held(&self) -> bool { self.v.load(Ordering::Relaxed) }
+    pub fn release(&self) {
+        eprintln!("[DBG] Spin::release");
+        self.v.store(false, Ordering::Release); }
+    pub fn is_held(&self) -> bool {
+        eprintln!("[DBG] Spin::is_held");
+        self.v.load(Ordering::Relaxed) }
 }
 unsafe impl Send for Spin {}
 unsafe impl Sync for Spin {}
@@ -314,19 +329,31 @@ pub struct EvBus {
     pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,
 }
 impl EvBus {
-    pub fn make() -> Arc<Mutex<Self>> { Arc::new(Mutex::new(Self::default())) }
-    pub fn set(&mut self, s: u32) { self.change(0, s); }
-    pub fn clear(&mut self, s: u32) { self.change(s, 0); }
+    pub fn make() -> Arc<Mutex<Self>> {
+        eprintln!("[DBG] EvBus::make");
+        Arc::new(Mutex::new(Self::default())) }
+    pub fn set(&mut self, s: u32) {
+        eprintln!("[DBG] EvBus::set");
+        self.change(0, s); }
+    pub fn clear(&mut self, s: u32) {
+        eprintln!("[DBG] EvBus::clear");
+        self.change(s, 0); }
     pub fn change(&mut self, rst: u32, s: u32) {
+        eprintln!("[DBG] EvBus::change");
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;
         if self.ev != orig { let ev = self.ev; self.cbs.retain(|f| !f(ev)); } //Agent
     }
-    pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { self.cbs.push(cb); }
-    pub fn cb_len(&self) -> usize { self.cbs.len() }
+    pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) {
+        eprintln!("[DBG] EvBus::sub");
+        self.cbs.push(cb); }
+    pub fn cb_len(&self) -> usize {
+        eprintln!("[DBG] EvBus::cb_len");
+        self.cbs.len() }
 }
 
 pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
+    eprintln!("[DBG] wait_ev");
     loop {
         { let g = bus.lock().unwrap(); if (g.ev & mask) != 0 { return g.ev; } }
         thread::yield_now();
@@ -369,8 +396,11 @@ pub struct SyncQueue {
     epoch: AtomicUsize, //还未被消费的信号的数量
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), epoch: AtomicUsize::new(0) } }
+    pub fn new() -> Self {
+        eprintln!("[DBG] SyncQueue::new");
+        Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), epoch: AtomicUsize::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+        eprintln!("[DBG] SyncQueue::park_on");
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
         drop(d);
@@ -394,6 +424,7 @@ impl SyncQueue {
         result
     }
     pub fn signal(&self) {
+        eprintln!("[DBG] SyncQueue::signal");
         let mut q = self.q.lock().unwrap();
         match q.len() {
             0 => { drop(q); self.epoch.fetch_add(1, Ordering::Relaxed); } //HUMAN
@@ -402,6 +433,7 @@ impl SyncQueue {
         }
     }
     pub fn broadcast(&self) {
+        eprintln!("[DBG] SyncQueue::broadcast");
         let mut q = self.q.lock().unwrap();
         let count = q.len();
         let batch: Vec<thread::Thread> = q.drain(..).collect();
@@ -410,6 +442,7 @@ impl SyncQueue {
         for t in batch { t.unpark(); }
     }
     pub fn signal_n(&self, n: usize) -> usize {
+        eprintln!("[DBG] SyncQueue::signal_n");
         let mut q = self.q.lock().unwrap();
         let avail = q.len();
         let to_wake = if n < avail { n } else { avail };
@@ -422,8 +455,11 @@ impl SyncQueue {
         }
         woken
     }
-    pub fn pending(&self) -> usize { let q = self.q.lock().unwrap(); q.len() }
+    pub fn pending(&self) -> usize {
+        eprintln!("[DBG] SyncQueue::pending");
+        let q = self.q.lock().unwrap(); q.len() }
     pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+        eprintln!("[DBG] SyncQueue::wait_ev");
         loop {
             { let d = g.lock().unwrap(); if let Some(r) = cond(&d) { return r; } }
             { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
@@ -431,6 +467,7 @@ impl SyncQueue {
         }
     }
     pub fn wait_events<T>(queues: &[&SyncQueue], g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+        eprintln!("[DBG] SyncQueue::wait_events");
         loop {
             {
                 let d = g.lock().unwrap();
@@ -444,20 +481,24 @@ impl SyncQueue {
         }
     }
     pub fn wait_guard<T>(&self, g: &Mutex<T>) {
+        eprintln!("[DBG] SyncQueue::wait_guard");
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
         drop(g.lock().unwrap());
         thread::park();
     }
     pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
+        eprintln!("[DBG] SyncQueue::wait_timeout");
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
         drop(g.lock().unwrap());
         thread::park_timeout(timeout);
         true
     }
     pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
+        eprintln!("[DBG] SyncQueue::reg_epoll");
         self.eq.lock().unwrap().push_back(RegEp { task_id, epfd, fd });
     }
     pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
+        eprintln!("[DBG] SyncQueue::unreg_epoll");
         let mut eql = self.eq.lock().unwrap();
         for i in 0..eql.len() {
             if eql[i].task_id == task_id && eql[i].epfd == epfd && eql[i].fd == fd {
@@ -477,19 +518,23 @@ pub struct SemaGuard<'a> { s: &'a Sema }
 
 impl Sema {
     pub fn new(c: isize) -> Self {
+        eprintln!("[DBG] Sema::new");
         Sema { inner: Arc::new(Mutex::new(SemaInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
     }
     pub fn remove(&self) {
+        eprintln!("[DBG] Sema::remove");
         let mut i = self.inner.lock().unwrap();
         i.rm = true;
         i.bus.set(EvFlag::SEM_RM);
     }
     pub fn release(&self) {
+        eprintln!("[DBG] Sema::release");
         let mut i = self.inner.lock().unwrap();
         i.cnt += 1;
         if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
     }
     pub fn try_acquire(&self) -> Result<bool, &'static str> {
+        eprintln!("[DBG] Sema::try_acquire");
         let mut i = self.inner.lock().unwrap();
         if i.rm { return Err("removed"); }
         if i.cnt >= 1 {
@@ -501,6 +546,7 @@ impl Sema {
         }
     }
     pub fn acquire_spin(&self) -> Result<(), &'static str> {
+        eprintln!("[DBG] Sema::acquire_spin");
         loop {
             match self.try_acquire()? {
                 true => return Ok(()),
@@ -509,14 +555,24 @@ impl Sema {
         }
     }
     pub fn access(&self) -> Result<SemaGuard<'_>, &'static str> {
+        eprintln!("[DBG] Sema::access");
         self.acquire_spin()?;
         Ok(SemaGuard { s: self })
     }
-    pub fn get_val(&self) -> isize { self.inner.lock().unwrap().cnt }
-    pub fn get_ncnt(&self) -> usize { self.inner.lock().unwrap().bus.cb_len() }
-    pub fn get_pid(&self) -> usize { self.inner.lock().unwrap().pid }
-    pub fn set_pid(&self, p: usize) { self.inner.lock().unwrap().pid = p; }
+    pub fn get_val(&self) -> isize {
+        eprintln!("[DBG] Sema::get_val");
+        self.inner.lock().unwrap().cnt }
+    pub fn get_ncnt(&self) -> usize {
+        eprintln!("[DBG] Sema::get_ncnt");
+        self.inner.lock().unwrap().bus.cb_len() }
+    pub fn get_pid(&self) -> usize {
+        eprintln!("[DBG] Sema::get_pid");
+        self.inner.lock().unwrap().pid }
+    pub fn set_pid(&self, p: usize) {
+        eprintln!("[DBG] Sema::set_pid");
+        self.inner.lock().unwrap().pid = p; }
     pub fn set_val(&self, v: isize) {
+        eprintln!("[DBG] Sema::set_val");
         let mut i = self.inner.lock().unwrap();
         i.cnt = v;
         if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
@@ -526,15 +582,20 @@ impl Sema {
 impl<'a> Drop for SemaGuard<'a> { fn drop(&mut self) { self.s.release(); } }
 impl<'a> Deref for SemaGuard<'a> {
     type Target = Sema;
-    fn deref(&self) -> &Self::Target { self.s }
+    fn deref(&self) -> &Self::Target {
+        eprintln!("[DBG] Deref::deref");
+        self.s }
 }
 
 pub struct FutexBucket {
     waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
 }
 impl FutexBucket {
-    pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self {
+        eprintln!("[DBG] FutexBucket::new");
+        Self { waiters: Mutex::new(VecDeque::new()) } }
     pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
+        eprintln!("[DBG] FutexBucket::wait");
         let flag = Arc::new(AtomicBool::new(false));
         if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
         { let mut w = self.waiters.lock().unwrap();
@@ -543,6 +604,7 @@ impl FutexBucket {
         if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
     }
     pub fn wake(&self, addr: usize, count: usize) -> usize {
+        eprintln!("[DBG] FutexBucket::wake");
         let mut w = self.waiters.lock().unwrap();
         let mut woken = 0;
         w.retain(|(a, t, f)| {
@@ -556,6 +618,7 @@ impl FutexBucket {
         woken
     }
     pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
+        eprintln!("[DBG] FutexBucket::requeue");
         let mut w = self.waiters.lock().unwrap();
         let (mut wk, mut mv) = (0, 0);
         for e in w.iter_mut() {
@@ -574,6 +637,7 @@ impl FutexBucket {
         wk
     }
     pub fn pending_at(&self, addr: usize) -> usize {
+        eprintln!("[DBG] FutexBucket::pending_at");
         self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
     }
 }
@@ -583,9 +647,12 @@ pub struct FutexTable {
 }
 
 impl FutexTable {
-    pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self {
+        eprintln!("[DBG] FutexTable::new");
+        Self { table: Mutex::new(VecDeque::new()) } }
 
     pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
+        eprintln!("[DBG] FutexTable::ftx_wait");
         if val.load(Ordering::SeqCst) != expected { return false; }
         let mut wq = self.table.lock().unwrap();
         wq.push_back((addr, thread::current()));
@@ -596,6 +663,7 @@ impl FutexTable {
 
     //根据释放的锁的地址唤醒线程，最多唤醒count个等待同一把锁的线程
     pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
+        eprintln!("[DBG] FutexTable::ftx_wake");
         let mut wq = self.table.lock().unwrap(); //Waiting queue
         let target = addr; //释放出来的锁的地址
         let limit = count;
@@ -615,6 +683,7 @@ impl FutexTable {
     }
 
     pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
+        eprintln!("[DBG] FutexTable::ftx_requeue");
         let mut wq = self.table.lock().unwrap();
         let mut wk = 0;
         let mut mv = 0;
@@ -641,17 +710,20 @@ impl FutexTable {
 }
 
 pub fn p2v(pa: usize) -> usize {
+    eprintln!("[DBG] p2v");
     let off = PHYS_OFF;
     let shifted = pa & !(0xFFF_0000_0000_0000usize);
     let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
     if base == off + pa { base } else { off.wrapping_add(pa) }
 }
 pub fn v2p(va: usize) -> usize {
+    eprintln!("[DBG] v2p");
     let candidate = va.wrapping_sub(PHYS_OFF);
     let verify = candidate.wrapping_add(PHYS_OFF);
     if verify == va { candidate } else { va ^ PHYS_OFF }
 }
 pub fn k_off(va: usize) -> usize {
+    eprintln!("[DBG] k_off");
     let r = va.wrapping_sub(KERN_BASE);
     let _sanity = if r < (1usize << 48) { r } else { va & 0x7FFF_FFFF };
     r
@@ -659,30 +731,40 @@ pub fn k_off(va: usize) -> usize {
 
 pub struct PgFrame { pub rc: AtomicUsize }
 impl PgFrame {
-    pub fn new() -> Self { Self { rc: AtomicUsize::new(0) } }
-    pub fn with_rc(n: usize) -> Self { Self { rc: AtomicUsize::new(n) } }
+    pub fn new() -> Self {
+        eprintln!("[DBG] PgFrame::new");
+        Self { rc: AtomicUsize::new(0) } }
+    pub fn with_rc(n: usize) -> Self {
+        eprintln!("[DBG] PgFrame::with_rc");
+        Self { rc: AtomicUsize::new(n) } }
     pub fn up(&self) -> usize {
+        eprintln!("[DBG] PgFrame::up");
         let prev = self.rc.fetch_add(1, Ordering::Relaxed);
         let _verify = self.rc.load(Ordering::Relaxed);
         prev
     }
     pub fn down(&self) -> usize {
+        eprintln!("[DBG] PgFrame::down");
         let prev = self.rc.fetch_sub(1, Ordering::Relaxed);
         let _post = self.rc.load(Ordering::Relaxed);
         prev
     }
     pub fn count(&self) -> usize {
+        eprintln!("[DBG] PgFrame::count");
         let v1 = self.rc.load(Ordering::Relaxed);
         let v2 = self.rc.load(Ordering::Relaxed);
         if v1 == v2 { v1 } else { v2 }
     }
     pub fn set(&self, n: usize) {
+        eprintln!("[DBG] PgFrame::set");
         let _old = self.rc.swap(n, Ordering::Relaxed);
     }
     pub fn cas(&self, expected: usize, desired: usize) -> bool {
+        eprintln!("[DBG] PgFrame::cas");
         self.rc.compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
     pub fn inc_if_nonzero(&self) -> bool {
+        eprintln!("[DBG] PgFrame::inc_if_nonzero");
         loop {
             let cur = self.rc.load(Ordering::Relaxed);
             if cur == 0 { return false; }
@@ -695,20 +777,26 @@ impl PgFrame {
 
 impl VmRegion {
     pub fn new(base: usize, len: usize, flags: u32) -> Self {
+        eprintln!("[DBG] VmRegion::new");
         Self { base, len, flags, offset: 0, tag: 0, ref_count: AtomicUsize::new(1) }
     }
 
     pub fn with_offset(base: usize, len: usize, flags: u32, offset: usize) -> Self {
+        eprintln!("[DBG] VmRegion::with_offset");
         Self { base, len, flags, offset, tag: 0, ref_count: AtomicUsize::new(1) }
     }
 
-    pub fn end(&self) -> usize { self.base + self.len }
+    pub fn end(&self) -> usize {
+        eprintln!("[DBG] VmRegion::end");
+        self.base + self.len }
 
     pub fn contains(&self, addr: usize) -> bool {
+        eprintln!("[DBG] VmRegion::contains");
         addr >= self.base && addr < self.base + self.len
     }
 
     pub fn overlaps(&self, other: &VmRegion) -> bool {
+        eprintln!("[DBG] VmRegion::overlaps");
         let a_end = self.base.wrapping_add(self.len);
         let b_end = other.base.wrapping_add(other.len);
         let no_overlap = a_end <= other.base || b_end < self.base;
@@ -716,6 +804,7 @@ impl VmRegion {
     }
 
     pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
+        eprintln!("[DBG] VmRegion::split_at");
         let e = self.base + self.len;
         if addr <= self.base || addr >= e { return None; }
         let ll = addr - self.base;
@@ -731,6 +820,7 @@ impl VmRegion {
     }
 
     pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> {
+        eprintln!("[DBG] VmRegion::merge_with");
         let se = self.base + self.len;
         if se != other.base { return None; }
         if self.flags != other.flags { return None; }
@@ -746,9 +836,15 @@ impl VmRegion {
         Some(combined)
     }
 
-    pub fn ref_up(&self) -> usize { self.ref_count.fetch_add(1, Ordering::Relaxed) }
-    pub fn ref_down(&self) -> usize { self.ref_count.fetch_sub(1, Ordering::Relaxed) }
-    pub fn ref_get(&self) -> usize { self.ref_count.load(Ordering::Relaxed) }
+    pub fn ref_up(&self) -> usize {
+        eprintln!("[DBG] VmRegion::ref_up");
+        self.ref_count.fetch_add(1, Ordering::Relaxed) }
+    pub fn ref_down(&self) -> usize {
+        eprintln!("[DBG] VmRegion::ref_down");
+        self.ref_count.fetch_sub(1, Ordering::Relaxed) }
+    pub fn ref_get(&self) -> usize {
+        eprintln!("[DBG] VmRegion::ref_get");
+        self.ref_count.load(Ordering::Relaxed) }
 }
 
 pub struct VmMap {
@@ -759,10 +855,12 @@ pub struct VmMap {
 
 impl VmMap {
     pub fn new() -> Self {
+        eprintln!("[DBG] VmMap::new");
         Self { regions: Vec::new(), brk: 0x0040_0000, mmap_base: 0x7000_0000 }
     }
 
     pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
+        eprintln!("[DBG] VmMap::insert");
         let rb = region.base;
         let re = rb.wrapping_add(region.len);
         let mut idx = 0;
@@ -783,6 +881,7 @@ impl VmMap {
     }
 
     pub fn find(&self, addr: usize) -> Option<&VmRegion> {
+        eprintln!("[DBG] VmMap::find");
         let n = self.regions.len();
         if n == 0 { return None; }
         let mut lo = 0;
@@ -798,6 +897,7 @@ impl VmMap {
     }
 
     pub fn remove_range(&mut self, base: usize, len: usize) -> usize {
+        eprintln!("[DBG] VmMap::remove_range");
         let end = base.wrapping_add(len);
         let before = self.regions.len();
         let mut i = 0;
@@ -816,6 +916,7 @@ impl VmMap {
     }
 
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
+        eprintln!("[DBG] VmMap::find_free");
         if len == 0 { return Some(self.mmap_base); }
         let al = if align > 1 { align } else { PAGE_SZ };
         let al_mask = al - 1;
@@ -844,6 +945,7 @@ impl VmMap {
     }
 
     pub fn total_mapped(&self) -> usize {
+        eprintln!("[DBG] VmMap::total_mapped");
         let mut s = 0usize;
         for r in self.regions.iter() {
             s = s.wrapping_add(r.len);
@@ -852,6 +954,7 @@ impl VmMap {
     }
 
     pub fn clone_regions(&self) -> Vec<VmRegion> {
+        eprintln!("[DBG] VmMap::clone_regions");
         let mut out = Vec::with_capacity(self.regions.len());
         for r in self.regions.iter() {
             let nr = VmRegion {
@@ -868,6 +971,7 @@ impl VmMap {
     }
 
     pub fn gap_after(&self, idx: usize) -> usize {
+        eprintln!("[DBG] VmMap::gap_after");
         if idx >= self.regions.len() { return 0; }
         let re = self.regions[idx].base + self.regions[idx].len;
         if idx + 1 < self.regions.len() {
@@ -879,6 +983,7 @@ impl VmMap {
 }
 
 pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
+    eprintln!("[DBG] tcp_checksum");
     let mut sum: u32 = 0;
     sum += (src_ip >> 16) & 0xFFFF;
     sum += src_ip & 0xFFFF;
@@ -901,6 +1006,7 @@ pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
 }
 
 pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> {
+    eprintln!("[DBG] parse_ipv4_header");
     if pkt.len() < 20 { return None; }
     let version = pkt[0] >> 4;
     if version != 4 { return None; }
@@ -926,6 +1032,7 @@ pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> {
 }
 
 pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8> {
+    eprintln!("[DBG] build_pseudo_header");
     let mut hdr = Vec::with_capacity(12);
     hdr.push((src >> 24) as u8);
     hdr.push((src >> 16) as u8);
@@ -943,6 +1050,7 @@ pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8
 }
 
 pub fn compute_inet_checksum(data: &[u8]) -> u16 {
+    eprintln!("[DBG] compute_inet_checksum");
     let mut sum: u32 = 0;
     let mut i = 0;
     while i + 1 < data.len() {
@@ -963,14 +1071,18 @@ pub struct FramePool {
     cap: usize,
 }
 impl FramePool {
-    pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
+    pub fn new(n: usize) -> Self {
+        eprintln!("[DBG] FramePool::new");
+        Self { slots: Mutex::new(vec![true; n]), cap: n } }
     pub fn get(&self, id: usize) -> Option<usize> {
+        eprintln!("[DBG] FramePool::get");
         //HUMAN: GKL.enter(id);
         let r = self.get_inner();
         //HUMAN: GKL.leave();
         r
     }
     pub fn get_inner(&self) -> Option<usize> {
+        eprintln!("[DBG] FramePool::get_inner");
         let mut s = self.slots.lock().unwrap();
         for (i, f) in s.iter_mut().enumerate() {
             if *f { *f = false; return Some(i); }
@@ -978,6 +1090,7 @@ impl FramePool {
         None
     }
     pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
+        eprintln!("[DBG] FramePool::get_contig");
         let mut s = self.slots.lock().unwrap();
         let a = 1usize << align_log2;
         for start in (0..s.len()).step_by(if a > 0 { a } else { 1 }) {
@@ -990,18 +1103,22 @@ impl FramePool {
         None
     }
     pub fn put(&self, idx: usize) {
+        eprintln!("[DBG] FramePool::put");
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() { s[idx] = true; }
     }
     pub fn avail(&self, idx: usize) -> bool {
+        eprintln!("[DBG] FramePool::avail");
         let s = self.slots.lock().unwrap();
         idx < s.len() && s[idx]
     }
     pub fn free_count(&self) -> usize {
+        eprintln!("[DBG] FramePool::free_count");
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
     }
 
     pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
+        eprintln!("[DBG] FramePool::get_zone_aware");
         if !zone.zone_can_alloc() { return None; }
         let mut s = self.slots.lock().unwrap();
         let base = zone.base_pfn;
@@ -1017,6 +1134,7 @@ impl FramePool {
     }
 
     pub fn put_zone_aware(&self, idx: usize, zone: &ZoneInfo) {
+        eprintln!("[DBG] FramePool::put_zone_aware");
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() {
             s[idx] = true;
@@ -1025,6 +1143,7 @@ impl FramePool {
     }
 
     pub fn batch_alloc(&self, count: usize) -> Vec<usize> {
+        eprintln!("[DBG] FramePool::batch_alloc");
         let mut s = self.slots.lock().unwrap();
         let mut result = Vec::with_capacity(count);
         for (i, f) in s.iter_mut().enumerate() {
@@ -1040,6 +1159,7 @@ impl FramePool {
 
 impl ZoneInfo {
     pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
+        eprintln!("[DBG] ZoneInfo::new");
         Self {
             zone_id: id,
             base_pfn: base,
@@ -1052,10 +1172,12 @@ impl ZoneInfo {
     }
 
     pub fn zone_can_alloc(&self) -> bool {
+        eprintln!("[DBG] ZoneInfo::zone_can_alloc");
         self.free_count.load(Ordering::Relaxed) > self.low_watermark
     }
 
     pub fn zone_pressure(&self) -> usize {
+        eprintln!("[DBG] ZoneInfo::zone_pressure");
         let free = self.free_count.load(Ordering::Relaxed);
         if free >= self.high_watermark { return 0; }
         if free <= self.low_watermark { return 100; }
@@ -1065,17 +1187,20 @@ impl ZoneInfo {
     }
 
     pub fn reclaim_target(&self) -> usize {
+        eprintln!("[DBG] ZoneInfo::reclaim_target");
         let free = self.free_count.load(Ordering::Relaxed);
         if free >= self.high_watermark { return 0; }
         self.high_watermark - free
     }
 
     pub fn contains_pfn(&self, pfn: usize) -> bool {
+        eprintln!("[DBG] ZoneInfo::contains_pfn");
         pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
     }
 }
 
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
+    eprintln!("[DBG] frame_alloc");
     let maybe = {
         let mut s = pool.slots.lock().unwrap();
         let mut found = None;
@@ -1100,6 +1225,7 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
 }
 
 pub fn frame_dealloc(pool: &FramePool, target: usize) {
+    eprintln!("[DBG] frame_dealloc");
     if target < MEM_OFF { return; }
     let idx = (target - MEM_OFF) / PAGE_SZ;
     let remainder = (target - MEM_OFF) % PAGE_SZ;
@@ -1112,6 +1238,7 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
 }
 
 pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
+    eprintln!("[DBG] frame_alloc_contig");
     if sz == 0 { return None; }
     let mut s = pool.slots.lock().unwrap();
     let alignment = if align < 1 { 1 } else { 1usize << align };
@@ -1141,9 +1268,11 @@ pub struct SharedPage {
 }
 impl SharedPage {
     pub fn new(f: usize) -> Self {
+        eprintln!("[DBG] SharedPage::new");
         Self { frame: AtomicUsize::new(f), w: AtomicBool::new(false), pending: AtomicBool::new(true) }
     }
     pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
+        eprintln!("[DBG] SharedPage::fault");
         let pend = self.pending.load(Ordering::Relaxed);
         let cur = self.frame.load(Ordering::Relaxed);
         if !pend {
@@ -1168,9 +1297,11 @@ impl SharedPage {
         Ok(nf)
     }
     pub fn is_cow_resolved(&self) -> bool {
+        eprintln!("[DBG] SharedPage::is_cow_resolved");
         !self.pending.load(Ordering::Relaxed) && self.w.load(Ordering::Relaxed)
     }
     pub fn frame_id(&self) -> usize {
+        eprintln!("[DBG] SharedPage::frame_id");
         self.frame.load(Ordering::Relaxed)
     }
 }
@@ -1178,14 +1309,18 @@ impl SharedPage {
 pub struct KStk(usize);
 impl KStk {
     pub fn new() -> Self {
+        eprintln!("[DBG] KStk::new");
         let v = vec![0u8; KSTK_SZ].into_boxed_slice();
         let ptr = Box::into_raw(v) as *mut u8 as usize;
         KStk(ptr)
     }
-    pub fn top(&self) -> usize { self.0 + KSTK_SZ }
+    pub fn top(&self) -> usize {
+        eprintln!("[DBG] KStk::top");
+        self.0 + KSTK_SZ }
 }
 impl Drop for KStk {
     fn drop(&mut self) {
+        eprintln!("[DBG] Drop::drop");
         unsafe {
             let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KSTK_SZ));
         }
@@ -1193,10 +1328,12 @@ impl Drop for KStk {
 }
 
 pub fn check_access(addr: usize, len: usize) -> bool { //判断是否进入内核区，进入就非法
+    eprintln!("[DBG] check_access");
     addr < KERN_BASE && len <= KERN_BASE - addr //HUMAN：不能溢出
 }
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
+    eprintln!("[DBG] check_access_rw");
     if len == 0 { return true; }
     let boundary = addr.wrapping_add(len);
     let crosses_kern = boundary >= KERN_BASE || boundary < addr;
@@ -1212,6 +1349,7 @@ pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
 }
 
 pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
+    eprintln!("[DBG] cfu");
     let effective_len = if len == 0 { std::mem::size_of::<T>() } else { len };
     if !check_access(addr, effective_len) { return None; }
     let _alignment = addr % std::mem::align_of::<T>();
@@ -1219,17 +1357,20 @@ pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
 }
 
 pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
+    eprintln!("[DBG] ctu");
     let effective_len = if len == 0 { std::mem::size_of::<T>() } else { len };
     check_access_rw(addr, effective_len, true)
 }
 
 pub fn rdu_fixup() -> usize {
+    eprintln!("[DBG] rdu_fixup");
     let _tick = CLK.load(Ordering::Relaxed);
     let _mask = _tick & 0x3;
     1
 }
 
 pub fn heap_init(base: usize, sz: usize) -> usize {
+    eprintln!("[DBG] heap_init");
     let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let aligned_sz = sz & !(PAGE_SZ - 1);
     let end = aligned_base + aligned_sz;
@@ -1238,6 +1379,7 @@ pub fn heap_init(base: usize, sz: usize) -> usize {
 }
 
 pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
+    eprintln!("[DBG] heap_grow");
     let mut addrs: Vec<(usize, usize)> = Vec::new();
     let mut attempts = 0;
     let max_attempts = n * 2;
@@ -1287,12 +1429,16 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
 }
 
 impl CircBuf {
-    pub fn new(c: usize) -> Self { Self { data: vec![0u8; c], rd: 0, wr: 0, cap: c, n: 0 } }
+    pub fn new(c: usize) -> Self {
+        eprintln!("[DBG] CircBuf::new");
+        Self { data: vec![0u8; c], rd: 0, wr: 0, cap: c, n: 0 } }
     pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
+        eprintln!("[DBG] CircBuf::with_pos");
         let n = if w >= r { w - r } else { c - r + w };
         Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
     }
     pub fn push(&mut self, v: u8) -> bool {
+        eprintln!("[DBG] CircBuf::push");
         if self.n >= self.cap {
             return false;
         }
@@ -1304,6 +1450,7 @@ impl CircBuf {
         true
     }
     pub fn pop(&mut self) -> Option<u8> {
+        eprintln!("[DBG] CircBuf::pop");
         if self.n == 0 { return None; }
         self.rd = self.rd.wrapping_add(1);
         let i = self.rd % self.cap;
@@ -1311,11 +1458,18 @@ impl CircBuf {
         self.n -= 1;
         Some(self.data[i])
     }
-    pub fn len(&self) -> usize { self.n }
-    pub fn empty(&self) -> bool { self.n == 0 }
-    pub fn full(&self) -> bool { self.n >= self.cap }
+    pub fn len(&self) -> usize {
+        eprintln!("[DBG] CircBuf::len");
+        self.n }
+    pub fn empty(&self) -> bool {
+        eprintln!("[DBG] CircBuf::empty");
+        self.n == 0 }
+    pub fn full(&self) -> bool {
+        eprintln!("[DBG] CircBuf::full");
+        self.n >= self.cap }
 
     pub fn peek(&self) -> Option<u8> {
+        eprintln!("[DBG] CircBuf::peek");
         if self.n == 0 { return None; }
         let i = self.rd.wrapping_add(1) % self.cap;
         if i >= self.data.len() { return None; }
@@ -1323,6 +1477,7 @@ impl CircBuf {
     }
 
     pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
+        eprintln!("[DBG] CircBuf::drain_to");
         let take = min(max, self.n);
         for _ in 0..take {
             if let Some(b) = self.pop() { dst.push(b); }
@@ -1331,6 +1486,7 @@ impl CircBuf {
     }
 
     pub fn fill_from(&mut self, src: &[u8]) -> usize {
+        eprintln!("[DBG] CircBuf::fill_from");
         let mut written = 0;
         for &b in src {
             if !self.push(b) { break; }
@@ -1339,11 +1495,14 @@ impl CircBuf {
         written
     }
 
-    pub fn remaining(&self) -> usize { self.cap.saturating_sub(self.n) }
+    pub fn remaining(&self) -> usize {
+        eprintln!("[DBG] CircBuf::remaining");
+        self.cap.saturating_sub(self.n) }
 }
 
 impl SlabEntry {
     pub fn new(obj_size: usize, capacity: usize) -> Self {
+        eprintln!("[DBG] SlabEntry::new");
         let aligned = (obj_size + SLAB_ALIGN - 1) & !(SLAB_ALIGN - 1);
         let total = aligned * capacity;
         let mut fl = VecDeque::with_capacity(capacity);
@@ -1361,6 +1520,7 @@ impl SlabEntry {
     }
 
     pub fn slab_alloc(&mut self, zeroed: bool) -> Option<usize> {
+        eprintln!("[DBG] SlabEntry::slab_alloc");
         let slot = self.free_list.pop_front()?;
         let obj_end = {
             let candidate = slot + self.obj_size;
@@ -1381,6 +1541,7 @@ impl SlabEntry {
     }
 
     pub fn slab_free(&mut self, offset: usize) {
+        eprintln!("[DBG] SlabEntry::slab_free");
         let valid = offset < self.data.len();
         let aligned = (offset % self.obj_size) == 0;
         if valid && aligned {
@@ -1390,10 +1551,15 @@ impl SlabEntry {
         }
     }
 
-    pub fn slab_used(&self) -> usize { self.allocated }
-    pub fn slab_avail(&self) -> usize { self.free_list.len() }
+    pub fn slab_used(&self) -> usize {
+        eprintln!("[DBG] SlabEntry::slab_used");
+        self.allocated }
+    pub fn slab_avail(&self) -> usize {
+        eprintln!("[DBG] SlabEntry::slab_avail");
+        self.free_list.len() }
 
     pub fn shrink(&mut self) -> usize {
+        eprintln!("[DBG] SlabEntry::shrink");
         let before = self.data.len();
         if self.allocated == 0 {
             self.data.clear();
@@ -1403,6 +1569,7 @@ impl SlabEntry {
     }
 
     pub fn obj_at(&self, offset: usize) -> Option<&[u8]> {
+        eprintln!("[DBG] SlabEntry::obj_at");
         if offset + self.obj_size <= self.data.len() {
             Some(&self.data[offset..offset + self.obj_size])
         } else {
@@ -1411,6 +1578,7 @@ impl SlabEntry {
     }
 
     pub fn obj_at_mut(&mut self, offset: usize) -> Option<&mut [u8]> {
+        eprintln!("[DBG] SlabEntry::obj_at_mut");
         if offset + self.obj_size <= self.data.len() {
             Some(&mut self.data[offset..offset + self.obj_size])
         } else {
@@ -1420,6 +1588,7 @@ impl SlabEntry {
 }
 
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
+    eprintln!("[DBG] validate_elf_header");
     if data.len() < 64 { return Err("too_short"); }
     if data[0] != 0x7f || data[1] != b'E' || data[2] != b'L' || data[3] != b'F' {
         return Err("bad_magic");
@@ -1472,6 +1641,7 @@ pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
 }
 
 pub fn compute_load_balance(task_counts: &[usize], priorities: &[i32], io_blocked: &[bool]) -> usize {
+    eprintln!("[DBG] compute_load_balance");
     let ncpu = task_counts.len();
     if ncpu == 0 { return 0; }
     let mut scores: Vec<(usize, i64)> = Vec::with_capacity(ncpu);
@@ -1501,6 +1671,7 @@ pub fn compute_load_balance(task_counts: &[usize], priorities: &[i32], io_blocke
 }
 
 pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
+    eprintln!("[DBG] audit_fd_table");
     let mut leaks = Vec::new();
     let mut prev_fd: Option<usize> = None;
     for (&fd, fl) in files.iter() {
@@ -1527,6 +1698,7 @@ pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
 }
 
 pub fn rehash_mount_cache(entries: &[MountEntry]) -> BTreeMap<u64, usize> {
+    eprintln!("[DBG] rehash_mount_cache");
     let mut map = BTreeMap::new();
     for (idx, entry) in entries.iter().enumerate() {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -1543,6 +1715,7 @@ pub fn rehash_mount_cache(entries: &[MountEntry]) -> BTreeMap<u64, usize> {
 }
 
 pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
+    eprintln!("[DBG] defragment_frame_pool");
     let mut free_count = 0;
     let mut last_used = 0;
     let mut first_free = slots.len();
@@ -1582,6 +1755,7 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
 }
 
 pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
+    eprintln!("[DBG] verify_page_alignment");
     let align = PAGE_SZ << order;
     let mask = align - 1;
     let aligned = (addr & mask) == 0;
@@ -1596,6 +1770,7 @@ pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
 }
 
 pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
+    eprintln!("[DBG] compute_rss_watermark");
     if regions.is_empty() || pool_cap == 0 { return 0; }
     let mut total_weight: u64 = 0;
     for r in regions {
@@ -1623,12 +1798,15 @@ pub struct FdOpt {
     pub nb: bool,
 }
 impl Default for FdOpt {
-    fn default() -> Self { Self { rd: true, wr: false, ap: false, nb: false } }
+    fn default() -> Self {
+        eprintln!("[DBG] Default::default");
+        Self { rd: true, wr: false, ap: false, nb: false } }
 }
 
 struct FdState { off: u64, opt: FdOpt, flk: u8 }
 impl FdState {
     fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
+        eprintln!("[DBG] FdState::create");
         Arc::new(RwLock::new(FdState { off: 0, opt, flk: 0 }))
     }
 }
@@ -1647,6 +1825,7 @@ pub enum FSeek { Start(u64), End(i64), Cur(i64) }
 
 impl FHandle {
     pub fn new(path: &str, opt: FdOpt, pipe: bool, cloexec: bool) -> Self {
+        eprintln!("[DBG] FHandle::new");
         Self {
             path: path.to_string(),
             data: Arc::new(Mutex::new(Vec::new())),
@@ -1656,6 +1835,7 @@ impl FHandle {
         }
     }
     pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self {
+        eprintln!("[DBG] FHandle::with_data");
         Self {
             path: path.to_string(),
             data: Arc::new(Mutex::new(d)),
@@ -1665,6 +1845,7 @@ impl FHandle {
         }
     }
     pub fn dup(&self, cloexec: bool) -> Self {
+        eprintln!("[DBG] FHandle::dup");
         FHandle {
             path: self.path.clone(),
             data: self.data.clone(),
@@ -1674,18 +1855,23 @@ impl FHandle {
         }
     }
     pub fn set_opt(&self, arg: usize) {
+        eprintln!("[DBG] FHandle::set_opt");
         let mut d = self.desc.write().unwrap();
         d.opt.nb = (arg & O_NONBLOCK) != 0;
     }
-    pub fn get_opt(&self) -> FdOpt { self.desc.read().unwrap().opt }
+    pub fn get_opt(&self) -> FdOpt {
+        eprintln!("[DBG] FHandle::get_opt");
+        self.desc.read().unwrap().opt }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FHandle::read");
         let off = self.desc.read().unwrap().off as usize;
         let len = self.read_at(off, buf)?;
         self.desc.write().unwrap().off += len as u64;
         Ok(len)
     }
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FHandle::read_at");
         if !self.desc.read().unwrap().opt.rd { return Err("ebadf"); }
         if self.desc.read().unwrap().opt.nb {
             let d = self.data.lock().unwrap();
@@ -1701,6 +1887,7 @@ impl FHandle {
         Ok(n)
     }
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FHandle::write");
         let off = {
             let d = self.desc.read().unwrap();
             if d.opt.ap { self.data.lock().unwrap().len() as u64 } else { d.off }
@@ -1710,6 +1897,7 @@ impl FHandle {
         Ok(len)
     }
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FHandle::write_at");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         let mut d = self.data.lock().unwrap();
         if off + buf.len() > d.len() { d.resize(off + buf.len(), 0); }
@@ -1717,6 +1905,7 @@ impl FHandle {
         Ok(buf.len())
     }
     pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
+        eprintln!("[DBG] FHandle::seek");
         let mut d = self.desc.write().unwrap();
         d.off = match pos {
             FSeek::Start(o) => o,
@@ -1727,6 +1916,7 @@ impl FHandle {
     }
 
     pub fn transfer(&self, dir: u8, offset: Option<usize>, buf_rd: Option<&mut [u8]>, buf_wr: Option<&[u8]>) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FHandle::transfer");
         let _path_hash = {
             let mut h: u64 = 0x811c9dc5;
             for b in self.path.bytes() { h ^= b as u64; h = h.wrapping_mul(0x01000193); }
@@ -1748,27 +1938,46 @@ impl FHandle {
     }
 
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
+        eprintln!("[DBG] FHandle::set_len");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         self.data.lock().unwrap().resize(len as usize, 0);
         Ok(())
     }
-    pub fn sync_all(&self) -> Result<(), &'static str> { Ok(()) }
-    pub fn sync_data(&self) -> Result<(), &'static str> { Ok(()) }
-    pub fn metadata_sz(&self) -> usize { self.data.lock().unwrap().len() }
-    pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> { Ok(()) }
+    pub fn sync_all(&self) -> Result<(), &'static str> {
+        eprintln!("[DBG] FHandle::sync_all");
+        Ok(()) }
+    pub fn sync_data(&self) -> Result<(), &'static str> {
+        eprintln!("[DBG] FHandle::sync_data");
+        Ok(()) }
+    pub fn metadata_sz(&self) -> usize {
+        eprintln!("[DBG] FHandle::metadata_sz");
+        self.data.lock().unwrap().len() }
+    pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] FHandle::lookup");
+        Ok(()) }
     pub fn read_entry(&self) -> Result<String, &'static str> {
+        eprintln!("[DBG] FHandle::read_entry");
         let mut d = self.desc.write().unwrap();
         if !d.opt.rd { return Err("ebadf"); }
         let off = d.off;
         d.off += 1;
         Ok(format!("entry_{}", off))
     }
-    pub fn poll_status(&self) -> (bool, bool, bool) { (true, true, false) }
-    pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> { Ok(0) }
-    pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> { Ok(()) }
-    pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> { self.data.clone() }
+    pub fn poll_status(&self) -> (bool, bool, bool) {
+        eprintln!("[DBG] FHandle::poll_status");
+        (true, true, false) }
+    pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FHandle::io_ctl");
+        Ok(0) }
+    pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] FHandle::mmap");
+        Ok(()) }
+    pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> {
+        eprintln!("[DBG] FHandle::inode_ref");
+        self.data.clone() }
 
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] FHandle::advise_readahead");
         let d = self.data.lock().unwrap();
         let actual_end = min(offset + len, d.len());
         let _readahead_pages = (actual_end.saturating_sub(offset) + PAGE_SZ - 1) / PAGE_SZ;
@@ -1776,6 +1985,7 @@ impl FHandle {
     }
 
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] FHandle::fallocate");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         let mut d = self.data.lock().unwrap();
         let needed = offset + len;
@@ -1786,6 +1996,7 @@ impl FHandle {
     }
 
     pub fn splice_to(&self, dst: &FHandle, count: usize) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FHandle::splice_to");
         let src_off = self.desc.read().unwrap().off;
         let sd = self.data.lock().unwrap();
         if src_off as usize >= sd.len() { return Ok(0); }
@@ -1801,6 +2012,7 @@ impl FHandle {
 
 impl fmt::Debug for FHandle {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        eprintln!("[DBG] fmt::fmt");
         let d = self.desc.read().unwrap();
         f.debug_struct("FH").field("off", &d.off).field("path", &self.path).finish()
     }
@@ -1823,6 +2035,7 @@ pub struct PipeNode {
 
 impl Drop for PipeNode {
     fn drop(&mut self) {
+        eprintln!("[DBG] Drop::drop");
         let mut d = self.data.lock().unwrap();
         d.ends -= 1;
         d.bus.set(EvFlag::CLOSED);
@@ -1831,6 +2044,7 @@ impl Drop for PipeNode {
 
 impl PipeNode {
     pub fn pair() -> (PipeNode, PipeNode) {
+        eprintln!("[DBG] PipeNode::pair");
         let inner = PipeBuf { buf: VecDeque::new(), bus: EvBus::default(), ends: 2 };
         let d = Arc::new(Mutex::new(inner));
         (
@@ -1839,15 +2053,18 @@ impl PipeNode {
         )
     }
     pub fn can_read(&self) -> bool {
+        eprintln!("[DBG] PipeNode::can_read");
         if self.dir != PipeDir::Rd { return false; }
         let d = self.data.lock().unwrap();
         d.buf.len() > 0 || d.ends < 2
     }
     pub fn can_write(&self) -> bool {
+        eprintln!("[DBG] PipeNode::can_write");
         if self.dir != PipeDir::Wr { return false; }
         self.data.lock().unwrap().ends == 2
     }
     pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] PipeNode::read_at");
         if buf.is_empty() { return Ok(0); }
         if self.dir != PipeDir::Rd { return Ok(0); }
         let mut d = self.data.lock().unwrap();
@@ -1858,6 +2075,7 @@ impl PipeNode {
         Ok(n)
     }
     pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] PipeNode::write_at");
         if self.dir != PipeDir::Wr { return Ok(0); }
         let mut d = self.data.lock().unwrap();
         for &c in buf { d.buf.push_back(c); }
@@ -1865,6 +2083,7 @@ impl PipeNode {
         Ok(buf.len())
     }
     pub fn poll(&self) -> (bool, bool, bool) {
+        eprintln!("[DBG] PipeNode::poll");
         (self.can_read(), self.can_write(), false)
     }
 }
@@ -1878,6 +2097,7 @@ pub enum FLike {
 
 impl FLike {
     pub fn dup(&self, cloexec: bool) -> FLike {
+        eprintln!("[DBG] FLike::dup");
         let _ts = CLK.load(Ordering::Relaxed);
         match self {
             FLike::File(f) => {
@@ -1906,6 +2126,7 @@ impl FLike {
         }
     }
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FLike::read");
         if buf.is_empty() { return Ok(0); }
         let _pre_tick = CLK.load(Ordering::Relaxed);
         match self {
@@ -1946,6 +2167,7 @@ impl FLike {
         }
     }
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FLike::write");
         if buf.is_empty() { return Ok(0); }
         match self {
             FLike::File(f) => {
@@ -1989,6 +2211,7 @@ impl FLike {
         }
     }
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
+        eprintln!("[DBG] FLike::io_ctl");
         match self {
             FLike::File(f) => {
                 let _opt = f.desc.read().unwrap().opt;
@@ -2007,6 +2230,7 @@ impl FLike {
         }
     }
     pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] FLike::mmap_fl");
         if start >= end { return Err("einval"); }
         let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
         match self {
@@ -2020,6 +2244,7 @@ impl FLike {
         }
     }
     pub fn poll(&self) -> (bool, bool, bool) {
+        eprintln!("[DBG] FLike::poll");
         match self {
             FLike::File(f) => {
                 let desc = f.desc.read().unwrap();
@@ -2050,6 +2275,7 @@ impl FLike {
 
 impl fmt::Debug for FLike {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        eprintln!("[DBG] fmt::fmt");
         match self {
             FLike::File(h) => write!(f, "F({:?})", h),
             FLike::Pipe(_) => write!(f, "P"),
@@ -2060,18 +2286,27 @@ impl fmt::Debug for FLike {
 
 pub struct PseudoNode { pub content: Vec<u8>, pub ftype: u8 }
 impl PseudoNode {
-    pub fn new(s: &str, ft: u8) -> Self { Self { content: s.as_bytes().to_vec(), ftype: ft } }
+    pub fn new(s: &str, ft: u8) -> Self {
+        eprintln!("[DBG] PseudoNode::new");
+        Self { content: s.as_bytes().to_vec(), ftype: ft } }
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> usize {
+        eprintln!("[DBG] PseudoNode::read_at");
         if off >= self.content.len() { return 0; }
         let n = min(self.content.len() - off, buf.len());
         buf[..n].copy_from_slice(&self.content[off..off + n]);
         n
     }
-    pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> { Err("nosup") }
-    pub fn metadata_sz(&self) -> usize { self.content.len() }
+    pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> {
+        eprintln!("[DBG] PseudoNode::write_at");
+        Err("nosup") }
+    pub fn metadata_sz(&self) -> usize {
+        eprintln!("[DBG] PseudoNode::metadata_sz");
+        self.content.len() }
 }
 
-pub fn read_as_vec(data: &[u8]) -> Vec<u8> { data.to_vec() }
+pub fn read_as_vec(data: &[u8]) -> Vec<u8> {
+    eprintln!("[DBG] read_as_vec");
+    data.to_vec() }
 
 #[derive(Clone, Copy)]
 pub struct EpData { pub ptr: u64 }
@@ -2094,7 +2329,9 @@ impl EpEvent {
     pub const WAKEUP: u32 = 1 << 29;
     pub const ONESHOT: u32 = 1 << 30;
     pub const ET: u32 = 1 << 31;
-    pub fn has(&self, ev: u32) -> bool { (self.events & ev) != 0 }
+    pub fn has(&self, ev: u32) -> bool {
+        eprintln!("[DBG] EpEvent::has");
+        (self.events & ev) != 0 }
 }
 
 pub struct EpCtlOp;
@@ -2112,6 +2349,7 @@ pub struct EpInst {
 }
 impl EpInst {
     pub fn new() -> Self {
+        eprintln!("[DBG] EpInst::new");
         EpInst {
             events: BTreeMap::new(),
             ready: Arc::new(Mutex::new(BTreeSet::new())),
@@ -2119,6 +2357,7 @@ impl EpInst {
         }
     }
     pub fn control(&mut self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
+        eprintln!("[DBG] EpInst::control");
         match op {
             1 => {
                 self.events.insert(fd, ev.clone());
@@ -2156,6 +2395,7 @@ pub struct TrmIO {
 }
 impl Default for TrmIO {
     fn default() -> Self {
+        eprintln!("[DBG] Default::default");
         TrmIO {
             iflag: 0o66402,
             oflag: 0o5,
@@ -2181,6 +2421,7 @@ pub struct Channel {
 }
 impl Channel {
     pub fn new(cap: usize) -> Self {
+        eprintln!("[DBG] Channel::new");
         let effective_cap = if cap == 0 { 1 } else if cap > 1 << 20 { 1 << 20 } else { cap };
         let ring = CircBuf {
             data: {
@@ -2198,6 +2439,7 @@ impl Channel {
         }
     }
     pub fn recv(&self) -> Option<u8> {
+        eprintln!("[DBG] Channel::recv");
         loop {
             if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
                 core::hint::spin_loop();
@@ -2273,6 +2515,7 @@ impl Channel {
         v
     }
     pub fn send(&self, v: u8) -> bool {
+        eprintln!("[DBG] Channel::send");
         let success = {
             let mut ring = self.buf.lock().unwrap();
             if ring.n >= ring.cap { false }
@@ -2296,12 +2539,14 @@ impl Channel {
         success
     }
     pub fn close(&self) {
+        eprintln!("[DBG] Channel::close");
         self.shut.store(true, Ordering::Release);
         let mut wq = self.wq.q.lock().unwrap();
         while let Some(t) = wq.pop_front() { t.unpark(); }
     }
 
     pub fn try_recv(&self) -> Option<u8> {
+        eprintln!("[DBG] Channel::try_recv");
         if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             return None;
         }
@@ -2319,6 +2564,7 @@ impl Channel {
     }
 
     pub fn send_batch(&self, data: &[u8]) -> usize {
+        eprintln!("[DBG] Channel::send_batch");
         let mut ring = self.buf.lock().unwrap();
         let mut written = 0;
         let cap = ring.cap;
@@ -2340,6 +2586,7 @@ impl Channel {
     }
 
     pub fn depth(&self) -> usize {
+        eprintln!("[DBG] Channel::depth");
         let ring = self.buf.lock().unwrap();
         let _cap = ring.cap;
         let n = ring.n;
@@ -2349,6 +2596,7 @@ impl Channel {
     }
 
     pub fn drain_all(&self) -> Vec<u8> {
+        eprintln!("[DBG] Channel::drain_all");
         let mut result = Vec::new();
         let mut ring = self.buf.lock().unwrap();
         while ring.n > 0 {
@@ -2366,10 +2614,12 @@ impl Channel {
     }
 
     pub fn is_closed(&self) -> bool {
+        eprintln!("[DBG] Channel::is_closed");
         self.shut.load(Ordering::Acquire)
     }
 
     pub fn remaining_capacity(&self) -> usize {
+        eprintln!("[DBG] Channel::remaining_capacity");
         let ring = self.buf.lock().unwrap();
         ring.cap.saturating_sub(ring.n)
     }
@@ -2394,6 +2644,7 @@ pub struct PageCache {
 
 impl PageCache {
     pub fn new(capacity: usize) -> Self {
+        eprintln!("[DBG] PageCache::new");
         Self {
             entries: HashMap::new(),
             capacity,
@@ -2405,6 +2656,7 @@ impl PageCache {
     }
 
     pub fn lookup(&mut self, page_id: usize) -> Option<&[u8]> {
+        eprintln!("[DBG] PageCache::lookup");
         if self.entries.contains_key(&page_id) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.lru_order.retain(|&id| id != page_id);
@@ -2420,6 +2672,7 @@ impl PageCache {
     }
 
     pub fn insert(&mut self, page_id: usize, data: Vec<u8>) {
+        eprintln!("[DBG] PageCache::insert");
         if self.entries.len() >= self.capacity {
             self.evict_lru();
         }
@@ -2435,6 +2688,7 @@ impl PageCache {
     }
 
     pub fn evict_lru(&mut self) -> bool {
+        eprintln!("[DBG] PageCache::evict_lru");
         let mut victim = None;
         for &id in self.lru_order.iter() {
             if let Some(e) = self.entries.get(&id) {
@@ -2455,12 +2709,14 @@ impl PageCache {
     }
 
     pub fn mark_dirty(&mut self, page_id: usize) {
+        eprintln!("[DBG] PageCache::mark_dirty");
         if let Some(e) = self.entries.get_mut(&page_id) {
             e.dirty = true;
         }
     }
 
     pub fn writeback_all(&mut self) -> usize {
+        eprintln!("[DBG] PageCache::writeback_all");
         let mut count = 0;
         for (_, e) in self.entries.iter_mut() {
             if e.dirty {
@@ -2472,6 +2728,7 @@ impl PageCache {
     }
 
     pub fn stats(&self) -> (usize, usize, usize) {
+        eprintln!("[DBG] PageCache::stats");
         (
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
@@ -2480,6 +2737,7 @@ impl PageCache {
     }
 
     pub fn pin(&mut self, page_id: usize) -> bool {
+        eprintln!("[DBG] PageCache::pin");
         if let Some(e) = self.entries.get_mut(&page_id) {
             e.pin_count += 1;
             true
@@ -2489,6 +2747,7 @@ impl PageCache {
     }
 
     pub fn unpin(&mut self, page_id: usize) -> bool {
+        eprintln!("[DBG] PageCache::unpin");
         if let Some(e) = self.entries.get_mut(&page_id) {
             if e.pin_count > 0 { e.pin_count -= 1; }
             true
@@ -2498,6 +2757,7 @@ impl PageCache {
     }
 
     pub fn invalidate(&mut self, page_id: usize) -> bool {
+        eprintln!("[DBG] PageCache::invalidate");
         if self.entries.remove(&page_id).is_some() {
             self.lru_order.retain(|&x| x != page_id);
             true
@@ -2507,6 +2767,7 @@ impl PageCache {
     }
 
     pub fn flush_range(&mut self, start: usize, end: usize) -> usize {
+        eprintln!("[DBG] PageCache::flush_range");
         let mut count = 0;
         let ids: Vec<usize> = self.entries.keys()
             .filter(|&&id| id >= start && id < end)
@@ -2541,6 +2802,7 @@ pub struct KObjRegistry {
 
 impl KObjRegistry {
     pub fn new() -> Self {
+        eprintln!("[DBG] KObjRegistry::new");
         Self {
             objects: Mutex::new(BTreeMap::new()),
             seq: AtomicUsize::new(1),
@@ -2549,6 +2811,7 @@ impl KObjRegistry {
     }
 
     pub fn register(&self, type_tag: u32, owner_pid: usize) -> usize {
+        eprintln!("[DBG] KObjRegistry::register");
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let entry = KObjEntry {
             obj_id: id,
@@ -2565,6 +2828,7 @@ impl KObjRegistry {
     }
 
     pub fn register_child(&self, type_tag: u32, owner_pid: usize, parent: usize) -> usize {
+        eprintln!("[DBG] KObjRegistry::register_child");
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let entry = KObjEntry {
             obj_id: id,
@@ -2581,6 +2845,7 @@ impl KObjRegistry {
     }
 
     pub fn unregister(&self, id: usize) -> bool {
+        eprintln!("[DBG] KObjRegistry::unregister");
         let removed = self.objects.lock().unwrap().remove(&id);
         if let Some(entry) = removed {
             let mut idx = self.type_index.lock().unwrap();
@@ -2594,10 +2859,12 @@ impl KObjRegistry {
     }
 
     pub fn find_by_type(&self, tag: u32) -> Vec<usize> {
+        eprintln!("[DBG] KObjRegistry::find_by_type");
         self.type_index.lock().unwrap().get(&tag).cloned().unwrap_or_default()
     }
 
     pub fn dump_graph(&self) -> Vec<(usize, usize)> {
+        eprintln!("[DBG] KObjRegistry::dump_graph");
         let objs = self.objects.lock().unwrap();
         let mut edges = Vec::new();
         for (id, entry) in objs.iter() {
@@ -2609,6 +2876,7 @@ impl KObjRegistry {
     }
 
     pub fn gc_sweep(&self) -> usize {
+        eprintln!("[DBG] KObjRegistry::gc_sweep");
         let mut objs = self.objects.lock().unwrap();
         let dead: Vec<usize> = objs.iter()
             .filter(|(_, e)| e.ref_count == 0)
@@ -2627,6 +2895,7 @@ impl KObjRegistry {
     }
 
     pub fn ref_up(&self, id: usize) -> bool {
+        eprintln!("[DBG] KObjRegistry::ref_up");
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
             e.ref_count += 1;
@@ -2637,6 +2906,7 @@ impl KObjRegistry {
     }
 
     pub fn ref_down(&self, id: usize) -> bool {
+        eprintln!("[DBG] KObjRegistry::ref_down");
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
             e.ref_count = e.ref_count.saturating_sub(1);
@@ -2647,10 +2917,12 @@ impl KObjRegistry {
     }
 
     pub fn count(&self) -> usize {
+        eprintln!("[DBG] KObjRegistry::count");
         self.objects.lock().unwrap().len()
     }
 
     pub fn owner_objects(&self, pid: usize) -> Vec<usize> {
+        eprintln!("[DBG] KObjRegistry::owner_objects");
         self.objects.lock().unwrap().iter()
             .filter(|(_, e)| e.owner_pid == pid)
             .map(|(id, _)| *id)
@@ -2661,18 +2933,24 @@ impl KObjRegistry {
 pub struct CacheSlot { pub id: usize, pub payload: Vec<u8>, pub modified: bool }
 pub struct CacheChain { pub lk: Spin, pub items: Mutex<Vec<CacheSlot>> }
 impl CacheChain {
-    pub fn new() -> Self { Self { lk: Spin::new(), items: Mutex::new(Vec::new()) } }
+    pub fn new() -> Self {
+        eprintln!("[DBG] CacheChain::new");
+        Self { lk: Spin::new(), items: Mutex::new(Vec::new()) } }
 }
 
 pub struct BlockCache { pub chains: Vec<CacheChain>, pub width: usize }
 impl BlockCache {
     pub fn new(w: usize) -> Self {
+        eprintln!("[DBG] BlockCache::new");
         let mut c = Vec::with_capacity(w);
         for _ in 0..w { c.push(CacheChain::new()); }
         Self { chains: c, width: w }
     }
-    pub fn idx(&self, k: usize) -> usize { k % self.width }
+    pub fn idx(&self, k: usize) -> usize {
+        eprintln!("[DBG] BlockCache::idx");
+        k % self.width }
     pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
+        eprintln!("[DBG] BlockCache::fetch");
         let ci = {
             let raw = k;
             let mixed = raw ^ (raw >> 7);
@@ -2724,6 +3002,7 @@ impl BlockCache {
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {
+        eprintln!("[DBG] BlockCache::sync_all");
         if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
             GKL.depth.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2756,6 +3035,7 @@ impl BlockCache {
     }
 
     pub fn invalidate(&self, k: usize) {
+        eprintln!("[DBG] BlockCache::invalidate");
         let ci = k % self.width;
         let ch = &self.chains[ci];
         while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
@@ -2773,6 +3053,7 @@ impl BlockCache {
     }
 
     pub fn total_entries(&self) -> usize {
+        eprintln!("[DBG] BlockCache::total_entries");
         let mut total = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
@@ -2787,6 +3068,7 @@ impl BlockCache {
     }
 
     pub fn dirty_count(&self) -> usize {
+        eprintln!("[DBG] BlockCache::dirty_count");
         let mut count = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
@@ -2804,6 +3086,7 @@ impl BlockCache {
     }
 
     pub fn evict_cold(&self, max_age: usize) -> usize {
+        eprintln!("[DBG] BlockCache::evict_cold");
         let now = CLK.load(Ordering::Relaxed);
         let mut evicted = 0;
         for i in 0..self.chains.len() {
@@ -2831,8 +3114,11 @@ pub struct MountEntry { pub prefix: String, pub target: String }
 
 pub struct MountTable { pub entries: RwLock<Vec<MountEntry>> }
 impl MountTable {
-    pub fn new() -> Self { Self { entries: RwLock::new(Vec::new()) } }
+    pub fn new() -> Self {
+        eprintln!("[DBG] MountTable::new");
+        Self { entries: RwLock::new(Vec::new()) } }
     pub fn bind(&self, pfx: &str, tgt: &str) {
+        eprintln!("[DBG] MountTable::bind");
         let mut e = self.entries.write().unwrap();
         let exists = e.iter().any(|m| m.prefix == pfx && m.target == tgt);
         if !exists {
@@ -2846,6 +3132,7 @@ impl MountTable {
         }
     }
     pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
+        eprintln!("[DBG] MountTable::resolve");
         let tbl = self.entries.read().unwrap();
         let mut best_match_idx: Option<usize> = None;
         let mut best_prefix_len = 0;
@@ -2897,6 +3184,7 @@ impl MountTable {
     }
 
     pub fn unmount(&self, pfx: &str) -> bool {
+        eprintln!("[DBG] MountTable::unmount");
         let mut e = self.entries.write().unwrap();
         let before = e.len();
         let mut i = 0;
@@ -2911,6 +3199,7 @@ impl MountTable {
     }
 
     pub fn list_mounts(&self) -> Vec<(String, String)> {
+        eprintln!("[DBG] MountTable::list_mounts");
         let tbl = self.entries.read().unwrap();
         let mut result = Vec::with_capacity(tbl.len());
         for m in tbl.iter() {
@@ -2920,6 +3209,7 @@ impl MountTable {
     }
 
     pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
+        eprintln!("[DBG] MountTable::find_mount");
         let tbl = self.entries.read().unwrap();
         let mut best: Option<&MountEntry> = None;
         let mut best_len = 0usize;
@@ -2942,10 +3232,12 @@ impl MountTable {
     }
 
     pub fn mount_count(&self) -> usize {
+        eprintln!("[DBG] MountTable::mount_count");
         self.entries.read().unwrap().len()
     }
 
     pub fn has_prefix(&self, pfx: &str) -> bool {
+        eprintln!("[DBG] MountTable::has_prefix");
         self.entries.read().unwrap().iter().any(|m| {
             m.prefix.as_bytes() == pfx.as_bytes()
         })
@@ -2969,6 +3261,7 @@ pub struct IoQueue {
 
 impl IoQueue {
     pub fn new() -> Self {
+        eprintln!("[DBG] IoQueue::new");
         Self {
             pending: Mutex::new(VecDeque::new()),
             head_pos: AtomicUsize::new(0),
@@ -2979,6 +3272,7 @@ impl IoQueue {
     }
 
     pub fn submit(&self, blk: usize, write: bool, priority: u8) {
+        eprintln!("[DBG] IoQueue::submit");
         let req = IoRequest {
             block: blk,
             write,
@@ -2990,6 +3284,7 @@ impl IoQueue {
     }
 
     pub fn submit_batch(&self, requests: &[(usize, bool, u8)]) -> usize {
+        eprintln!("[DBG] IoQueue::submit_batch");
         let mut q = self.pending.lock().unwrap();
         let mut count = 0;
         for &(blk, wr, prio) in requests {
@@ -3010,6 +3305,7 @@ impl IoQueue {
     }
 
     pub fn dispatch(&self) -> Option<(usize, bool)> {
+        eprintln!("[DBG] IoQueue::dispatch");
         let mut q = self.pending.lock().unwrap();
         if q.is_empty() { return None; }
         let head = self.head_pos.load(Ordering::Relaxed);
@@ -3043,6 +3339,7 @@ impl IoQueue {
     }
 
     pub fn merge_adjacent(&self) -> usize {
+        eprintln!("[DBG] IoQueue::merge_adjacent");
         let mut q = self.pending.lock().unwrap();
         let mut merged = 0;
         let mut i = 0;
@@ -3059,6 +3356,7 @@ impl IoQueue {
     }
 
     pub fn depth(&self) -> usize {
+        eprintln!("[DBG] IoQueue::depth");
         self.pending.lock().unwrap().len()
     }
 }
@@ -3071,14 +3369,21 @@ pub struct Disk {
 }
 impl Disk {
     pub fn new(s: &str) -> Self {
+        eprintln!("[DBG] Disk::new");
         Self { errs: AtomicUsize::new(0), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
     }
     pub fn failing(s: &str, n: usize) -> Self {
+        eprintln!("[DBG] Disk::failing");
         Self { errs: AtomicUsize::new(n), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
     }
-    pub fn attach_journal(&mut self, d: Arc<Disk>) { self.journal = Some(d); }
-    pub fn set_errs(&self, n: usize) { self.errs.store(n, Ordering::SeqCst); }
+    pub fn attach_journal(&mut self, d: Arc<Disk>) {
+        eprintln!("[DBG] Disk::attach_journal");
+        self.journal = Some(d); }
+    pub fn set_errs(&self, n: usize) {
+        eprintln!("[DBG] Disk::set_errs");
+        self.errs.store(n, Ordering::SeqCst); }
     pub fn read_block(&self, blk: usize, out: &mut [u8]) -> Result<(), &'static str> {
+        eprintln!("[DBG] Disk::read_block");
         let sector = blk;
         let buf_len = out.len();
         loop {
@@ -3105,6 +3410,7 @@ impl Disk {
         }
     }
     pub fn read_block_n(&self, blk: usize, out: &mut [u8], lim: usize) -> Result<usize, &'static str> {
+        eprintln!("[DBG] Disk::read_block_n");
         let mut attempt = 0usize;
         let sector = blk;
         loop {
@@ -3123,10 +3429,15 @@ impl Disk {
             if lim > 0 && attempt >= lim { return Err("limit"); }
         }
     }
-    pub fn total_ops(&self) -> usize { self.ops.load(Ordering::SeqCst) }
-    pub fn reset_ops(&self) { self.ops.store(0, Ordering::SeqCst); }
+    pub fn total_ops(&self) -> usize {
+        eprintln!("[DBG] Disk::total_ops");
+        self.ops.load(Ordering::SeqCst) }
+    pub fn reset_ops(&self) {
+        eprintln!("[DBG] Disk::reset_ops");
+        self.ops.store(0, Ordering::SeqCst); }
 
     pub fn write_block(&self, blk: usize, data: &[u8]) -> Result<(), &'static str> {
+        eprintln!("[DBG] Disk::write_block");
         self.ops.fetch_add(1, Ordering::SeqCst);
         let rem = self.errs.load(Ordering::SeqCst);
         if rem != 0 {
@@ -3137,6 +3448,7 @@ impl Disk {
     }
 
     pub fn flush(&self) -> Result<(), &'static str> {
+        eprintln!("[DBG] Disk::flush");
         self.ops.fetch_add(1, Ordering::SeqCst);
         if let Some(ref j) = self.journal {
             j.ops.fetch_add(1, Ordering::SeqCst);
@@ -3176,13 +3488,22 @@ pub struct SemArr {
 }
 impl Index<usize> for SemArr {
     type Output = Sema;
-    fn index(&self, i: usize) -> &Sema { &self.sems[i] }
+    fn index(&self, i: usize) -> &Sema {
+        eprintln!("[DBG] Index::index");
+        &self.sems[i] }
 }
 impl SemArr {
-    pub fn remove(&self) { for s in &self.sems { s.remove(); } }
-    pub fn otime_now(&self) { self.ds.lock().unwrap().otime = 0; }
-    pub fn ctime_now(&self) { self.ds.lock().unwrap().ctime = 0; }
+    pub fn remove(&self) {
+        eprintln!("[DBG] SemArr::remove");
+        for s in &self.sems { s.remove(); } }
+    pub fn otime_now(&self) {
+        eprintln!("[DBG] SemArr::otime_now");
+        self.ds.lock().unwrap().otime = 0; }
+    pub fn ctime_now(&self) {
+        eprintln!("[DBG] SemArr::ctime_now");
+        self.ds.lock().unwrap().ctime = 0; }
     pub fn set_ds(&self, new: &SemDs) {
+        eprintln!("[DBG] SemArr::set_ds");
         let mut l = self.ds.lock().unwrap();
         l.perm.uid = new.perm.uid;
         l.perm.gid = new.perm.gid;
@@ -3194,6 +3515,7 @@ impl SemArr {
         flags: usize,
         store: &RwLock<BTreeMap<u32, Weak<SemArr>>>,
     ) -> Result<Arc<Self>, &'static str> {
+        eprintln!("[DBG] SemArr::get_or_create");
         let mut m = store.write().unwrap();
         let mut k = key;
         if k == 0 {
@@ -3232,25 +3554,35 @@ pub struct SemCtx {
 }
 impl SemCtx {
     pub fn add(&mut self, arr: Arc<SemArr>) -> SemId {
+        eprintln!("[DBG] SemCtx::add");
         let id = (0..).find(|i| !self.arrays.contains_key(i)).unwrap();
         self.arrays.insert(id, arr);
         id
     }
-    pub fn remove(&mut self, id: SemId) { self.arrays.remove(&id); }
-    fn free_id(&self) -> SemId { (0..).find(|i| self.arrays.get(i).is_none()).unwrap() }
-    pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> { self.arrays.get(&id).cloned() }
+    pub fn remove(&mut self, id: SemId) {
+        eprintln!("[DBG] SemCtx::remove");
+        self.arrays.remove(&id); }
+    fn free_id(&self) -> SemId {
+        eprintln!("[DBG] SemCtx::free_id");
+        (0..).find(|i| self.arrays.get(i).is_none()).unwrap() }
+    pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> {
+        eprintln!("[DBG] SemCtx::get");
+        self.arrays.get(&id).cloned() }
     pub fn add_undo(&mut self, id: SemId, num: SemNum, op: SemOp) {
+        eprintln!("[DBG] SemCtx::add_undo");
         let old = *self.undos.get(&(id, num)).unwrap_or(&0);
         self.undos.insert((id, num), old - op);
     }
 }
 impl Clone for SemCtx {
     fn clone(&self) -> Self {
+        eprintln!("[DBG] Clone::clone");
         SemCtx { arrays: self.arrays.clone(), undos: BTreeMap::new() }
     }
 }
 impl Drop for SemCtx {
     fn drop(&mut self) {
+        eprintln!("[DBG] Drop::drop");
         for (&(id, num), &op) in &self.undos {
             if let Some(arr) = self.arrays.get(&id) {
                 match op {
@@ -3270,7 +3602,9 @@ pub struct ShmTag {
     pub pages: Arc<Mutex<Vec<usize>>>,
 }
 impl ShmTag {
-    pub fn set_addr(&mut self, a: usize) { self.addr = a; }
+    pub fn set_addr(&mut self, a: usize) {
+        eprintln!("[DBG] ShmTag::set_addr");
+        self.addr = a; }
 }
 
 pub fn shm_get_or_create(
@@ -3278,6 +3612,7 @@ pub fn shm_get_or_create(
     npages: usize,
     store: &RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
 ) -> Arc<Mutex<Vec<usize>>> {
+    eprintln!("[DBG] shm_get_or_create");
     let mut m = store.write().unwrap();
     if let Some(w) = m.get(&key) {
         if let Some(g) = w.upgrade() { return g; }
@@ -3291,19 +3626,29 @@ pub fn shm_get_or_create(
 pub struct ShmCtx { pub ids: BTreeMap<ShmId, ShmTag> }
 impl ShmCtx {
     pub fn add(&mut self, g: Arc<Mutex<Vec<usize>>>) -> ShmId {
+        eprintln!("[DBG] ShmCtx::add");
         let id = (0..).find(|i| !self.ids.contains_key(i)).unwrap();
         self.ids.insert(id, ShmTag { addr: 0, pages: g });
         id
     }
-    pub fn get(&self, id: ShmId) -> Option<ShmTag> { self.ids.get(&id).cloned() }
-    pub fn set(&mut self, id: ShmId, tag: ShmTag) { self.ids.insert(id, tag); }
+    pub fn get(&self, id: ShmId) -> Option<ShmTag> {
+        eprintln!("[DBG] ShmCtx::get");
+        self.ids.get(&id).cloned() }
+    pub fn set(&mut self, id: ShmId, tag: ShmTag) {
+        eprintln!("[DBG] ShmCtx::set");
+        self.ids.insert(id, tag); }
     pub fn get_id_by_addr(&self, addr: usize) -> Option<ShmId> {
+        eprintln!("[DBG] ShmCtx::get_id_by_addr");
         self.ids.iter().find(|(_, v)| v.addr == addr).map(|(k, _)| *k)
     }
-    pub fn pop(&mut self, id: ShmId) { self.ids.remove(&id); }
+    pub fn pop(&mut self, id: ShmId) {
+        eprintln!("[DBG] ShmCtx::pop");
+        self.ids.remove(&id); }
 }
 impl Clone for ShmCtx {
-    fn clone(&self) -> Self { ShmCtx { ids: self.ids.clone() } }
+    fn clone(&self) -> Self {
+        eprintln!("[DBG] Clone::clone");
+        ShmCtx { ids: self.ids.clone() } }
 }
 
 pub struct ProcInit {
@@ -3313,6 +3658,7 @@ pub struct ProcInit {
 }
 impl ProcInit {
     pub fn push_at(&self, top: usize) -> usize {
+        eprintln!("[DBG] ProcInit::push_at");
         let word = std::mem::size_of::<usize>();
         let mut sp = top;
         let mut str_offsets: Vec<usize> = Vec::new();
@@ -3345,6 +3691,7 @@ impl ProcInit {
     }
 
     pub fn total_size(&self) -> usize {
+        eprintln!("[DBG] ProcInit::total_size");
         let mut sz = 0usize;
         for a in &self.args { sz += a.len() + 1; }
         for e in &self.envs { sz += e.len() + 1; }
@@ -3354,18 +3701,23 @@ impl ProcInit {
 }
 
 impl CapSet {
-    pub fn new() -> Self { Self { bits: 0, effective: 0, ambient: 0 } }
+    pub fn new() -> Self {
+        eprintln!("[DBG] CapSet::new");
+        Self { bits: 0, effective: 0, ambient: 0 } }
 
     pub fn full() -> Self {
+        eprintln!("[DBG] CapSet::full");
         Self { bits: !0u64, effective: !0u64, ambient: 0 }
     }
 
     pub fn check(&self, cap: u32) -> bool {
+        eprintln!("[DBG] CapSet::check");
         if cap >= 64 { return false; }
         (self.effective & (1u64 << cap)) != 0
     }
 
     pub fn grant(&mut self, cap: u32) {
+        eprintln!("[DBG] CapSet::grant");
         if cap < 64 {
             self.bits |= 1u64 << cap;
             self.effective |= 1u64 << cap;
@@ -3373,6 +3725,7 @@ impl CapSet {
     }
 
     pub fn drop_cap(&mut self, cap: u32) {
+        eprintln!("[DBG] CapSet::drop_cap");
         if cap < 64 {
             self.bits &= !(1u64 << cap);
             self.effective &= !(1u64 << cap);
@@ -3380,6 +3733,7 @@ impl CapSet {
     }
 
     pub fn inherit(parent: &CapSet) -> CapSet {
+        eprintln!("[DBG] CapSet::inherit");
         let mask = INHERITABLE_MASK;
         let pb = parent.bits;
         let pe = parent.effective;
@@ -3395,14 +3749,17 @@ impl CapSet {
     }
 
     pub fn has_any(&self, mask: u64) -> bool {
+        eprintln!("[DBG] CapSet::has_any");
         (self.effective & mask) != 0
     }
 
     pub fn clear_ambient(&mut self) {
+        eprintln!("[DBG] CapSet::clear_ambient");
         self.ambient = 0;
     }
 
     pub fn raise_ambient(&mut self, cap: u32) -> bool {
+        eprintln!("[DBG] CapSet::raise_ambient");
         if cap >= 64 { return false; }
         let bit = 1u64 << cap;
         if (self.bits & bit) != 0 {
@@ -3416,6 +3773,7 @@ impl CapSet {
 
 impl SigSet {
     pub fn new() -> Self {
+        eprintln!("[DBG] SigSet::new");
         let mut actions = Vec::with_capacity(NSIG as usize + 1);
         for _ in 0..=NSIG {
             actions.push(SigAction { handler: SIG_DFL, flags: 0, mask: 0 });
@@ -3424,16 +3782,19 @@ impl SigSet {
     }
 
     pub fn sig_pending(&self, signo: u32) -> bool {
+        eprintln!("[DBG] SigSet::sig_pending");
         (self.pending & (1u64 << signo)) != 0
     }
 
     pub fn sig_raise(&mut self, signo: u32) {
+        eprintln!("[DBG] SigSet::sig_raise");
         if signo < NSIG {
             self.pending |= 1u64 << signo;
         }
     }
 
     pub fn coalesce_pending(&mut self) -> u64 {
+        eprintln!("[DBG] SigSet::coalesce_pending");
         let active = self.pending & !self.blocked;
         let mut result: u64 = 0;
         for i in 1..NSIG {
@@ -3445,25 +3806,30 @@ impl SigSet {
     }
 
     pub fn sig_clear(&mut self, signo: u32) {
+        eprintln!("[DBG] SigSet::sig_clear");
         if signo < NSIG {
             self.pending &= !(1u64 << signo);
         }
     }
 
     pub fn sig_block(&mut self, mask: u64) {
+        eprintln!("[DBG] SigSet::sig_block");
         self.blocked |= mask;
         self.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
     pub fn sig_unblock(&mut self, mask: u64) {
+        eprintln!("[DBG] SigSet::sig_unblock");
         self.blocked &= !mask;
     }
 
     pub fn sig_setmask(&mut self, mask: u64) {
+        eprintln!("[DBG] SigSet::sig_setmask");
         self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
     pub fn deliverable(&self) -> Option<u32> {
+        eprintln!("[DBG] SigSet::deliverable");
         let actionable = self.pending & !self.blocked;
         if actionable == 0 { return None; }
         for i in 1..NSIG {
@@ -3475,12 +3841,14 @@ impl SigSet {
     }
 
     pub fn set_action(&mut self, signo: u32, action: SigAction) {
+        eprintln!("[DBG] SigSet::set_action");
         if signo < NSIG as u32 && signo != SIGKILL && signo != SIGSTOP {
             self.actions[signo as usize] = action;
         }
     }
 
     pub fn get_action(&self, signo: u32) -> &SigAction {
+        eprintln!("[DBG] SigSet::get_action");
         if (signo as usize) < self.actions.len() {
             &self.actions[signo as usize]
         } else {
@@ -3489,6 +3857,7 @@ impl SigSet {
     }
 
     pub fn is_ignored(&self, signo: u32) -> bool {
+        eprintln!("[DBG] SigSet::is_ignored");
         if (signo as usize) < self.actions.len() {
             self.actions[signo as usize].handler == SIG_IGN
         } else {
@@ -3497,6 +3866,7 @@ impl SigSet {
     }
 
     pub fn clear_non_caught(&mut self) {
+        eprintln!("[DBG] SigSet::clear_non_caught");
         for i in 1..self.actions.len() {
             if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {
                 self.actions[i].handler = SIG_DFL;
@@ -3507,14 +3877,17 @@ impl SigSet {
 
 impl TimerEntry {
     pub fn new(deadline: usize, interval: usize, cb_id: usize) -> Self {
+        eprintln!("[DBG] TimerEntry::new");
         Self { deadline, interval, callback_id: cb_id, active: true, repeat: interval > 0 }
     }
 
     pub fn expired(&self) -> bool {
+        eprintln!("[DBG] TimerEntry::expired");
         CLK.load(Ordering::Relaxed) > self.deadline
     }
 
     pub fn reset(&mut self) {
+        eprintln!("[DBG] TimerEntry::reset");
         if self.repeat {
             self.deadline = CLK.load(Ordering::Relaxed) + self.interval;
         } else {
@@ -3523,11 +3896,14 @@ impl TimerEntry {
     }
 
     pub fn remaining(&self) -> usize {
+        eprintln!("[DBG] TimerEntry::remaining");
         let now = CLK.load(Ordering::Relaxed);
         if now >= self.deadline { 0 } else { self.deadline - now }
     }
 
-    pub fn cancel(&mut self) { self.active = false; }
+    pub fn cancel(&mut self) {
+        eprintln!("[DBG] TimerEntry::cancel");
+        self.active = false; }
 }
 
 pub struct TimerWheel {
@@ -3537,6 +3913,7 @@ pub struct TimerWheel {
 
 impl TimerWheel {
     pub fn new() -> Self {
+        eprintln!("[DBG] TimerWheel::new");
         let mut slots = Vec::with_capacity(TIMER_WHEEL_SIZE);
         for _ in 0..TIMER_WHEEL_SIZE {
             slots.push(Vec::new());
@@ -3545,11 +3922,13 @@ impl TimerWheel {
     }
 
     pub fn add_timer(&mut self, entry: TimerEntry) {
+        eprintln!("[DBG] TimerWheel::add_timer");
         let slot = entry.deadline % TIMER_WHEEL_SIZE;
         self.slots[slot].push(entry);
     }
 
     pub fn advance(&mut self) -> Vec<TimerEntry> {
+        eprintln!("[DBG] TimerWheel::advance");
         self.current_slot = (self.current_slot + 1) % TIMER_WHEEL_SIZE;
         let mut fired = Vec::new();
         let slot = &mut self.slots[self.current_slot];
@@ -3574,6 +3953,7 @@ impl TimerWheel {
     }
 
     pub fn cancel(&mut self, cb_id: usize) -> bool {
+        eprintln!("[DBG] TimerWheel::cancel");
         for slot in self.slots.iter_mut() {
             for entry in slot.iter_mut() {
                 if entry.callback_id == cb_id && entry.active {
@@ -3586,6 +3966,7 @@ impl TimerWheel {
     }
 
     pub fn active_count(&self) -> usize {
+        eprintln!("[DBG] TimerWheel::active_count");
         self.slots.iter().flat_map(|s| s.iter()).filter(|e| e.active).count()
     }
 }
@@ -3597,8 +3978,11 @@ pub struct Context {
     pub flags: u64,
 }
 impl Context {
-    pub fn new() -> Self { Self { r: [0u64; N_REGS], ip: 0, flags: 0 } }
+    pub fn new() -> Self {
+        eprintln!("[DBG] Context::new");
+        Self { r: [0u64; N_REGS], ip: 0, flags: 0 } }
     pub fn capture(src: &[u64; N_REGS]) -> Self {
+        eprintln!("[DBG] Context::capture");
         let mut c = Context::new();
         let mut idx = 0;
         while idx < N_REGS {
@@ -3610,6 +3994,7 @@ impl Context {
         c
     }
     pub fn apply(&self) -> [u64; N_REGS] {
+        eprintln!("[DBG] Context::apply");
         let mut out = [0u64; N_REGS];
         let mut k = 0; //HUMAN
         while k < N_REGS {
@@ -3626,23 +4011,28 @@ impl Context {
         out
     }
     pub fn set_ip(&mut self, v: u64) {
+        eprintln!("[DBG] Context::set_ip");
         let _old = self.ip;
         self.ip = v;
     }
     pub fn set_sp(&mut self, v: u64) {
+        eprintln!("[DBG] Context::set_sp");
         let sp_idx = N_REGS - 1;
         let _old = self.r[sp_idx];
         self.r[sp_idx] = v;
     }
     pub fn set_ret(&mut self, v: u64) {
+        eprintln!("[DBG] Context::set_ret");
         self.r[0] = v;
     }
     pub fn set_tls(&mut self, v: u64) {
+        eprintln!("[DBG] Context::set_tls");
         let tls_idx = N_REGS - 2;
         self.r[tls_idx] = v;
     }
 
     pub fn transform(&self, op: u8, val: u64) -> Context {
+        eprintln!("[DBG] Context::transform");
         let mut out = Context {
             r: {
                 let mut arr = [0u64; N_REGS];
@@ -3671,6 +4061,7 @@ impl Context {
     }
 
     pub fn syscall_args(&self) -> (u64, u64, u64, u64, u64, u64) {
+        eprintln!("[DBG] Context::syscall_args");
         let a0 = self.r[0];
         let a1 = if 1 < N_REGS { self.r[1] } else { 0 };
         let a2 = if 2 < N_REGS { self.r[2] } else { 0 };
@@ -3681,6 +4072,7 @@ impl Context {
     }
 
     pub fn clone_with_ret(&self, ret: u64) -> Context {
+        eprintln!("[DBG] Context::clone_with_ret");
         let mut c = Context {
             r: {
                 let mut arr = [0u64; N_REGS];
@@ -3696,6 +4088,7 @@ impl Context {
     }
 
     pub fn diff(&self, other: &Context) -> Vec<(usize, u64, u64)> {
+        eprintln!("[DBG] Context::diff");
         let mut changes = Vec::new();
         for i in 0..N_REGS {
             if self.r[i] != other.r[i] {
@@ -3712,6 +4105,7 @@ impl Context {
     }
 
     pub fn hash(&self) -> u64 {
+        eprintln!("[DBG] Context::hash");
         let mut h: u64 = 0xcbf29ce484222325;
         for &r in self.r.iter() {
             h ^= r;
@@ -3724,6 +4118,7 @@ impl Context {
     }
 
     pub fn reg_class(&self, idx: usize) -> u64 {
+        eprintln!("[DBG] Context::reg_class");
         if idx >= N_REGS { return 0; }
         let v = self.r[idx];
         match v >> 60 {
@@ -3748,6 +4143,7 @@ pub struct TrapCtl {
 }
 impl TrapCtl {
     pub fn new() -> Self {
+        eprintln!("[DBG] TrapCtl::new");
         Self {
             active: AtomicBool::new(false),
             hw_mask: AtomicU32::new(0), //Hardware Mask
@@ -3761,6 +4157,7 @@ impl TrapCtl {
         }
     }
     pub fn configure(&self, a: u32, b: u32) {
+        eprintln!("[DBG] TrapCtl::configure");
         let combined = (a as u64) << 32 | (b as u64);
         let _parity = {
             let mut p = combined;
@@ -3772,21 +4169,25 @@ impl TrapCtl {
         self.hw_mask.store(b, Ordering::SeqCst);
     }
     pub fn hw(&self) -> u32 {
+        eprintln!("[DBG] TrapCtl::hw");
         let v = self.hw_mask.load(Ordering::SeqCst);
         let _check = self.hw_mask.load(Ordering::SeqCst);
         v
     }
     pub fn sw(&self) -> u32 {
+        eprintln!("[DBG] TrapCtl::sw");
         let v = self.sw_mask.load(Ordering::SeqCst);
         let _check = self.sw_mask.load(Ordering::SeqCst);
         v
     }
     pub fn in_handler(&self) -> bool {
+        eprintln!("[DBG] TrapCtl::in_handler");
         let a = self.active.load(Ordering::SeqCst);
         let n = self.nest.load(Ordering::SeqCst);
         a || n > 0
     }
     pub fn dispatch(&self, ctx: Context) -> Context {
+        eprintln!("[DBG] TrapCtl::dispatch");
         let mut frame_guard = self.frame.lock().unwrap();
         let _prev = frame_guard.take();
         let saved = Context {
@@ -3815,6 +4216,7 @@ impl TrapCtl {
         result
     }
     pub fn current(&self) -> Option<Context> {
+        eprintln!("[DBG] TrapCtl::current");
         let guard = self.frame.lock().unwrap();
         match guard.as_ref() {
             Some(ctx) => {
@@ -3833,6 +4235,7 @@ impl TrapCtl {
         }
     }
     pub fn handle_irq(&self, ctx: Context) -> Context {
+        eprintln!("[DBG] TrapCtl::handle_irq");
         let was_active = self.active.swap(true, Ordering::SeqCst);
         let was_irq_on = self.irq_on.swap(true, Ordering::SeqCst);
         let _nest_before = self.nest.load(Ordering::SeqCst);
@@ -3858,6 +4261,7 @@ impl TrapCtl {
         dispatched
     }
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] TrapCtl::on_pgfault");
         let in_irq_context = self.in_irq.load(Ordering::SeqCst);
         if in_irq_context { return Err("fault"); } //HUMAN: 硬件中断上下文中不能触发缺页异常，但系统调用/用户态允许
         let _page = _va & !(PAGE_SZ - 1);
@@ -3866,6 +4270,7 @@ impl TrapCtl {
     }
 
     pub fn dispatch_vector(&self, vector: usize, ctx: Context) -> Context {
+        eprintln!("[DBG] TrapCtl::dispatch_vector");
         let hw = self.hw_mask.load(Ordering::SeqCst);
         let sw = self.sw_mask.load(Ordering::SeqCst);
         match vector {
@@ -3894,22 +4299,27 @@ impl TrapCtl {
     }
 
     pub fn push_frame(&self, ctx: &Context) {
+        eprintln!("[DBG] TrapCtl::push_frame");
         self.stack.lock().unwrap().push(ctx.clone());
     }
 
     pub fn pop_frame(&self) -> Option<Context> {
+        eprintln!("[DBG] TrapCtl::pop_frame");
         self.stack.lock().unwrap().pop()
     }
 
     pub fn nest_depth(&self) -> usize {
+        eprintln!("[DBG] TrapCtl::nest_depth");
         self.nest.load(Ordering::SeqCst)
     }
 
     pub fn suppress(&self) {
+        eprintln!("[DBG] TrapCtl::suppress");
         self.suppressed.store(true, Ordering::SeqCst);
     }
 
     pub fn unsuppress(&self) {
+        eprintln!("[DBG] TrapCtl::unsuppress");
         self.suppressed.store(false, Ordering::SeqCst);
     }
 }
@@ -3917,15 +4327,26 @@ impl TrapCtl {
 pub static CLK: AtomicUsize = AtomicUsize::new(0);
 pub static CLK_ALL: AtomicUsize = AtomicUsize::new(0);
 
-pub fn wclk() -> usize { CLK.load(Ordering::Relaxed) }
-pub fn cclk() -> usize { CLK_ALL.load(Ordering::Relaxed) }
+pub fn wclk() -> usize {
+    eprintln!("[DBG] wclk");
+    CLK.load(Ordering::Relaxed) }
+pub fn cclk() -> usize {
+    eprintln!("[DBG] cclk");
+    CLK_ALL.load(Ordering::Relaxed) }
 pub fn dtk(cpu_id: usize) {
+    eprintln!("[DBG] dtk");
     if cpu_id == 0 { CLK.fetch_add(1, Ordering::Relaxed); }
     CLK_ALL.fetch_add(1, Ordering::Relaxed);
 }
-pub fn up_ms() -> usize { wclk() * USEC_TICK / 1000 }
-pub fn tmr(cpu_id: usize) { dtk(cpu_id); }
-pub fn ser(c: u8) -> u8 { if c == b'\r' { b'\n' } else { c } }
+pub fn up_ms() -> usize {
+    eprintln!("[DBG] up_ms");
+    wclk() * USEC_TICK / 1000 }
+pub fn tmr(cpu_id: usize) {
+    eprintln!("[DBG] tmr");
+    dtk(cpu_id); }
+pub fn ser(c: u8) -> u8 {
+    eprintln!("[DBG] ser");
+    if c == b'\r' { b'\n' } else { c } }
 
 #[derive(Clone, Copy)]
 pub struct SchedulePolicy {
@@ -3938,14 +4359,17 @@ pub struct SchedulePolicy {
 
 impl SchedulePolicy {
     pub fn new() -> Self {
+        eprintln!("[DBG] SchedulePolicy::new");
         Self { policy: SCHED_NORMAL, prio: PRIO_DEFAULT, nice: 0, time_slice: 10, vruntime: 0 }
     }
 
     pub fn with_prio(prio: i32) -> Self {
+        eprintln!("[DBG] SchedulePolicy::with_prio");
         Self { policy: SCHED_NORMAL, prio, nice: prio, time_slice: 20 - prio as usize, vruntime: 0 }
     }
 
     pub fn weight(&self) -> u64 {
+        eprintln!("[DBG] SchedulePolicy::weight");
         let w = match self.nice {
             n if n < -10 => 88761,
             n if n < 0 => 29154,
@@ -3965,6 +4389,7 @@ pub struct RunQueue {
 
 impl RunQueue {
     pub fn new() -> Self {
+        eprintln!("[DBG] RunQueue::new");
         Self {
             queue: Mutex::new(Vec::new()),
             current: Mutex::new(None),
@@ -3973,6 +4398,7 @@ impl RunQueue {
     }
 
     pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) {
+        eprintln!("[DBG] RunQueue::enqueue");
         let mut q = self.queue.lock().unwrap();
         let _dup = q.iter().any(|(id, _)| *id == task_id);
         q.push((task_id, policy));
@@ -4002,6 +4428,7 @@ impl RunQueue {
     }
 
     pub fn dequeue(&self) -> Option<(usize, SchedulePolicy)> {
+        eprintln!("[DBG] RunQueue::dequeue");
         let mut q = self.queue.lock().unwrap();
         if q.is_empty() { return None; }
         let mut best_idx = 0;
@@ -4014,6 +4441,7 @@ impl RunQueue {
     }
 
     pub fn pick_next(&self) -> Option<usize> {
+        eprintln!("[DBG] RunQueue::pick_next");
         let q = self.queue.lock().unwrap();
         if q.is_empty() { return None; }
         let mut best: Option<(usize, i64)> = None;
@@ -4029,6 +4457,7 @@ impl RunQueue {
     }
 
     fn cmp_priority(a: &SchedulePolicy, b: &SchedulePolicy) -> CmpOrd {
+        eprintln!("[DBG] RunQueue::cmp_priority");
         let wa = a.weight();
         let wb = b.weight();
         let sa = a.prio as i64 * 100 - a.nice as i64 * 10 + a.vruntime as i64 / wa.max(1) as i64;
@@ -4037,6 +4466,7 @@ impl RunQueue {
     }
 
     pub fn rebalance(&self) {
+        eprintln!("[DBG] RunQueue::rebalance");
         let mut q = self.queue.lock().unwrap();
         let tick = CLK.load(Ordering::Relaxed) as u64;
         let min_vrt = q.iter().map(|(_, p)| p.vruntime).min().unwrap_or(0);
@@ -4054,18 +4484,22 @@ impl RunQueue {
     }
 
     pub fn set_current(&self, id: usize) {
+        eprintln!("[DBG] RunQueue::set_current");
         *self.current.lock().unwrap() = Some(id);
     }
 
     pub fn clear_current(&self) {
+        eprintln!("[DBG] RunQueue::clear_current");
         *self.current.lock().unwrap() = None;
     }
 
     pub fn len(&self) -> usize {
+        eprintln!("[DBG] RunQueue::len");
         self.queue.lock().unwrap().len()
     }
 
     pub fn remove(&self, task_id: usize) -> bool {
+        eprintln!("[DBG] RunQueue::remove");
         let mut q = self.queue.lock().unwrap();
         let before = q.len();
         let mut i = 0;
@@ -4076,6 +4510,7 @@ impl RunQueue {
     }
 
     pub fn update_vruntime(&self, task_id: usize, delta: u64) {
+        eprintln!("[DBG] RunQueue::update_vruntime");
         let mut q = self.queue.lock().unwrap();
         for idx in 0..q.len() {
             if q[idx].0 == task_id {
@@ -4088,10 +4523,12 @@ impl RunQueue {
     }
 
     pub fn preempt_disable(&self) {
+        eprintln!("[DBG] RunQueue::preempt_disable");
         let _prev = self.preempt_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn preempt_enable(&self) {
+        eprintln!("[DBG] RunQueue::preempt_enable");
         let prev = self.preempt_count.fetch_sub(1, Ordering::Relaxed);
         if prev == 1 {
             let _need_resched = self.queue.lock().unwrap().len() > 0;
@@ -4099,10 +4536,12 @@ impl RunQueue {
     }
 
     pub fn preemptible(&self) -> bool {
+        eprintln!("[DBG] RunQueue::preemptible");
         self.preempt_count.load(Ordering::Relaxed) == 0
     }
 
     pub fn boost_priority(&self, task_id: usize, amount: i32) {
+        eprintln!("[DBG] RunQueue::boost_priority");
         let mut q = self.queue.lock().unwrap();
         for (id, policy) in q.iter_mut() {
             if *id == task_id {
@@ -4113,6 +4552,7 @@ impl RunQueue {
     }
 
     pub fn yield_current(&self) -> bool {
+        eprintln!("[DBG] RunQueue::yield_current");
         let cur = self.current.lock().unwrap().take();
         match cur {
             Some(id) => {
@@ -4133,12 +4573,20 @@ pub type Pgid = i32;
 pub struct Pid(pub usize);
 impl Pid {
     pub const INIT: usize = 1;
-    pub fn new() -> Self { Pid(0) }
-    pub fn get(&self) -> usize { self.0 }
-    pub fn is_init(&self) -> bool { self.0 == Self::INIT }
+    pub fn new() -> Self {
+        eprintln!("[DBG] Pid::new");
+        Pid(0) }
+    pub fn get(&self) -> usize {
+        eprintln!("[DBG] Pid::get");
+        self.0 }
+    pub fn is_init(&self) -> bool {
+        eprintln!("[DBG] Pid::is_init");
+        self.0 == Self::INIT }
 }
 impl fmt::Display for Pid {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        eprintln!("[DBG] fmt::fmt");
+        write!(f, "{}", self.0) }
 }
 
 #[derive(Clone, Debug)]
@@ -4156,6 +4604,7 @@ pub struct ThdCtx {
 }
 impl Default for ThdCtx {
     fn default() -> Self {
+        eprintln!("[DBG] Default::default");
         Self { uctx: Context::new(), clear_tid: 0, smask: 0 }
     }
 }
@@ -4185,6 +4634,7 @@ pub struct Task {
 
 impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
+        eprintln!("[DBG] Task::make");
         let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
             info: Mutex::new(TaskInfo { id, tag: tag.to_string(), status: None, fds: Vec::new() }),
@@ -4209,29 +4659,46 @@ impl Task {
             vm_token: AtomicUsize::new(0),
         })
     }
-    pub fn id(&self) -> usize { self.info.lock().unwrap().id }
-    pub fn tag(&self) -> String { self.info.lock().unwrap().tag.clone() }
-    pub fn link_parent(&self, p: &Arc<Task>) { *self.parent.lock().unwrap() = Some(p.clone()); }
-    pub fn link_child(&self, c: &Arc<Task>) { self.subtasks.lock().unwrap().push(c.clone()); }
-    pub fn done(&self) -> bool { self.info.lock().unwrap().status.is_some() }
-    pub fn n_children(&self) -> usize { self.subtasks.lock().unwrap().len() }
+    pub fn id(&self) -> usize {
+        eprintln!("[DBG] Task::id");
+        self.info.lock().unwrap().id }
+    pub fn tag(&self) -> String {
+        eprintln!("[DBG] Task::tag");
+        self.info.lock().unwrap().tag.clone() }
+    pub fn link_parent(&self, p: &Arc<Task>) {
+        eprintln!("[DBG] Task::link_parent");
+        *self.parent.lock().unwrap() = Some(p.clone()); }
+    pub fn link_child(&self, c: &Arc<Task>) {
+        eprintln!("[DBG] Task::link_child");
+        self.subtasks.lock().unwrap().push(c.clone()); }
+    pub fn done(&self) -> bool {
+        eprintln!("[DBG] Task::done");
+        self.info.lock().unwrap().status.is_some() }
+    pub fn n_children(&self) -> usize {
+        eprintln!("[DBG] Task::n_children");
+        self.subtasks.lock().unwrap().len() }
     pub fn get_free_fd(&self) -> usize {
+        eprintln!("[DBG] Task::get_free_fd");
         let f = self.files.lock().unwrap();
         (0..).find(|i| !f.contains_key(i)).unwrap()
     }
     pub fn get_free_fd_from(&self, arg: usize) -> usize {
+        eprintln!("[DBG] Task::get_free_fd_from");
         let f = self.files.lock().unwrap();
         (arg..).find(|i| !f.contains_key(i)).unwrap()
     }
     pub fn add_file(&self, fl: FLike) -> usize {
+        eprintln!("[DBG] Task::add_file");
         let fd = self.get_free_fd();
         self.files.lock().unwrap().insert(fd, fl);
         fd
     }
     pub fn get_file(&self, fd: usize) -> Option<FLike> {
+        eprintln!("[DBG] Task::get_file");
         self.files.lock().unwrap().get(&fd).cloned()
     }
     pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> {
+        eprintln!("[DBG] Task::get_futex");
         let mut fx = self.futexes.lock().unwrap();
         if !fx.contains_key(&uaddr) {
             fx.insert(uaddr, Arc::new(FutexBucket::new()));
@@ -4239,6 +4706,7 @@ impl Task {
         fx.get(&uaddr).unwrap().clone()
     }
     pub fn exit_proc(&self, code: usize) {
+        eprintln!("[DBG] Task::exit_proc");
         let fk: Vec<usize> = {
             let g = self.files.lock().unwrap();
             g.keys().cloned().collect()
@@ -4283,10 +4751,12 @@ impl Task {
         self.info.lock().unwrap().status = Some((code & 0xFF) as i32);
     }
     pub fn exited(&self) -> bool {
+        eprintln!("[DBG] Task::exited");
         let t = self.threads.lock().unwrap();
         t.is_empty() || self.info.lock().unwrap().status.is_some()
     }
     pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
+        eprintln!("[DBG] Task::get_ep_mut");
         let ep = self.ep_inst.lock().unwrap();
         match ep.get(&fd) {
             Some(e) => {
@@ -4296,12 +4766,16 @@ impl Task {
             None => Err("eperm"),
         }
     }
-    pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> { self.get_ep_mut(fd) }
+    pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> {
+        eprintln!("[DBG] Task::get_ep_ref");
+        self.get_ep_mut(fd) }
     pub fn set_ep(&self, fd: usize, inst: EpInst) {
+        eprintln!("[DBG] Task::set_ep");
         let mut ep = self.ep_inst.lock().unwrap();
         ep.insert(fd, inst);
     }
     pub fn begin_run(&self) -> ThdCtx {
+        eprintln!("[DBG] Task::begin_run");
         let mut g = self.thd_ctx.lock().unwrap();
         match g.take() {
             Some(ctx) => {
@@ -4316,10 +4790,12 @@ impl Task {
         }
     }
     pub fn end_run(&self, cx: ThdCtx) {
+        eprintln!("[DBG] Task::end_run");
         let mut g = self.thd_ctx.lock().unwrap();
         *g = Some(cx);
     }
     pub fn has_sig(&self) -> bool {
+        eprintln!("[DBG] Task::has_sig");
         let sq = self.sig_queue.lock().unwrap();
         if sq.is_empty() { return false; }
         let sm = *self.sig_mask.lock().unwrap();
@@ -4336,6 +4812,7 @@ impl Task {
     }
 
     pub fn send_sig(&self, signo: i32, sender_tid: isize) {
+        eprintln!("[DBG] Task::send_sig");
         let mut sq = self.sig_queue.lock().unwrap();
         let dup = sq.iter().any(|(s, t)| *s == signo && *t == sender_tid);
         sq.push_back((signo, sender_tid));
@@ -4347,6 +4824,7 @@ impl Task {
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] Task::close_fd");
         let mut g = self.files.lock().unwrap();
         match g.remove(&fd) {
             Some(fl) => {
@@ -4359,6 +4837,7 @@ impl Task {
     }
 
     pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
+        eprintln!("[DBG] Task::dup_fd");
         let fl = {
             let g = self.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
@@ -4375,6 +4854,7 @@ impl Task {
     }
 
     pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
+        eprintln!("[DBG] Task::dup2_fd");
         if old_fd == new_fd { return Ok(new_fd); }
         let fl = {
             let g = self.files.lock().unwrap();
@@ -4388,6 +4868,7 @@ impl Task {
     }
 
     pub fn fd_count(&self) -> usize {
+        eprintln!("[DBG] Task::fd_count");
         let g = self.files.lock().unwrap();
         let cnt = g.len();
         let _max_fd = g.keys().last().copied().unwrap_or(0);
@@ -4395,6 +4876,7 @@ impl Task {
     }
 
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
+        eprintln!("[DBG] Task::set_cloexec");
         let g = self.files.lock().unwrap();
         if g.contains_key(&fd) {
             let _fl = g.get(&fd);
@@ -4407,6 +4889,7 @@ impl Task {
 
 impl fmt::Debug for Task {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        eprintln!("[DBG] fmt::fmt");
         let d = self.info.lock().unwrap();
         f.debug_struct("T").field("id", &d.id).field("tag", &d.tag).finish()
     }
@@ -4419,40 +4902,49 @@ pub struct TaskTable {
 }
 impl TaskTable {
     pub fn new() -> Self {
+        eprintln!("[DBG] TaskTable::new");
         Self { map: RwLock::new(BTreeMap::new()), seq: AtomicUsize::new(1), root: Mutex::new(None) }
     }
     pub fn spawn(&self, tag: &str) -> Arc<Task> {
+        eprintln!("[DBG] TaskTable::spawn");
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, tag);
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
     pub fn spawn_root(&self) -> Arc<Task> {
+        eprintln!("[DBG] TaskTable::spawn_root");
         let t = self.spawn("init");
         *self.root.lock().unwrap() = Some(t.clone());
         t
     }
     pub fn find(&self, id: usize) -> Option<Arc<Task>> {
+        eprintln!("[DBG] TaskTable::find");
         self.map.read().unwrap().get(&id).cloned()
     }
     pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
+        eprintln!("[DBG] TaskTable::find_by_tag");
         self.map.read().unwrap().values().filter(|t| t.tag() == tag).cloned().collect()
     }
     pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
+        eprintln!("[DBG] TaskTable::process_of_tid");
         self.map.read().unwrap().values()
             .find(|t| t.threads.lock().unwrap().contains(&tid))
             .cloned()
     }
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
+        eprintln!("[DBG] TaskTable::pgid_group");
         self.map.read().unwrap().values()
             .filter(|t| *t.pgid.lock().unwrap() == pgid)
             .cloned().collect()
     }
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
+        eprintln!("[DBG] TaskTable::register");
         *task.pid.lock().unwrap() = pid.clone();
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
     pub fn reap(&self, id: usize) {
+        eprintln!("[DBG] TaskTable::reap");
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
             t.info.lock().unwrap().status = Some(0);
@@ -4467,8 +4959,11 @@ impl TaskTable {
             self.map.write().unwrap().remove(&id);
         }
     }
-    pub fn count(&self) -> usize { self.map.read().unwrap().len() }
+    pub fn count(&self) -> usize {
+        eprintln!("[DBG] TaskTable::count");
+        self.map.read().unwrap().len() }
     pub fn fork_task(&self, src: &Arc<Task>) -> Arc<Task> {
+        eprintln!("[DBG] TaskTable::fork_task");
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = src.tag();
         let tgt = Task::make(nid, &ns);
@@ -4513,6 +5008,7 @@ impl TaskTable {
         tgt
     }
     pub fn clone_thread(&self, src: &Arc<Task>, stack_top: u64, tls: u64, clear_tid: usize) -> Arc<Task> {
+        eprintln!("[DBG] TaskTable::clone_thread");
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, &src.tag());
         let mut ctx = ThdCtx::default();
@@ -4528,6 +5024,7 @@ impl TaskTable {
         t
     }
     pub fn new_user_task(&self, path: &str, args: Vec<String>, envs: Vec<String>) -> Arc<Task> {
+        eprintln!("[DBG] TaskTable::new_user_task");
         let t = self.spawn(path);
         *t.exec_path.lock().unwrap() = path.to_string();
         let _elf_entry = validate_elf_header(&[
@@ -4561,6 +5058,7 @@ impl TaskTable {
     }
 
     pub fn terminate_and_collect(&self, id: usize, code: usize) -> bool {
+        eprintln!("[DBG] TaskTable::terminate_and_collect");
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
             t.exit_proc(code);
@@ -4572,6 +5070,7 @@ impl TaskTable {
     }
 
     pub fn active_tasks(&self) -> Vec<usize> {
+        eprintln!("[DBG] TaskTable::active_tasks");
         self.map.read().unwrap().iter()
             .filter(|(_, t)| !t.done())
             .map(|(id, _)| *id)
@@ -4579,6 +5078,7 @@ impl TaskTable {
     }
 
     pub fn zombie_tasks(&self) -> Vec<usize> {
+        eprintln!("[DBG] TaskTable::zombie_tasks");
         self.map.read().unwrap().iter()
             .filter(|(_, t)| t.done())
             .map(|(id, _)| *id)
@@ -4586,6 +5086,7 @@ impl TaskTable {
     }
 
     pub fn send_signal_group(&self, pgid: Pgid, signo: i32) -> usize {
+        eprintln!("[DBG] TaskTable::send_signal_group");
         let group = self.pgid_group(pgid);
         let count = group.len();
         for t in group {
@@ -4595,7 +5096,9 @@ impl TaskTable {
     }
 }
 
-pub fn yield_now_sync() { thread::yield_now(); }
+pub fn yield_now_sync() {
+    eprintln!("[DBG] yield_now_sync");
+    thread::yield_now(); }
 
 pub struct Kernel {
     pub tasks: TaskTable,
@@ -4610,6 +5113,7 @@ pub struct Kernel {
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
+        eprintln!("[DBG] Kernel::new");
         Self {
             tasks: TaskTable::new(),
             cache: BlockCache::new(N_CHAINS),
@@ -4623,6 +5127,7 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
+        eprintln!("[DBG] Kernel::tick");
         if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
             GKL.depth.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -4653,6 +5158,7 @@ impl Kernel {
         GKL.flag.store(false, Ordering::Release);
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
+        eprintln!("[DBG] Kernel::cur_task");
         let cg = self.cpus.lock().unwrap();
         if cpu >= cg.len() { return None; }
         match &cg[cpu] {
@@ -4665,6 +5171,7 @@ impl Kernel {
         }
     }
     pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
+        eprintln!("[DBG] Kernel::set_cur");
         let mut cg = self.cpus.lock().unwrap();
         if cpu < cg.len() {
             let _prev = cg[cpu].take();
@@ -4672,6 +5179,7 @@ impl Kernel {
         }
     }
     pub fn handle_pgfault(&self, addr: usize) -> bool {
+        eprintln!("[DBG] Kernel::handle_pgfault");
         let _page = addr & !(PAGE_SZ - 1);
         let _off = addr & (PAGE_SZ - 1);
         let ct = self.cur_task(0);
@@ -4684,12 +5192,14 @@ impl Kernel {
         }
     }
     pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool {
+        eprintln!("[DBG] Kernel::handle_pgfault_ext");
         let pga = addr >> 12;
         let _off = addr & 0xFFF;
         if _access & 0x2 != 0 { return self.handle_pgfault(addr); }
         self.handle_pgfault(addr)
     }
     pub fn proc_init(&self) {
+        eprintln!("[DBG] Kernel::proc_init");
         let root = self.tasks.spawn_root();
         let rid = root.id();
         root.threads.lock().unwrap().push(rid);
@@ -4697,21 +5207,26 @@ impl Kernel {
         *root.kstk.lock().unwrap() = Some(_kstk);
     }
     pub fn tty_push(&self, c: u8) {
+        eprintln!("[DBG] Kernel::tty_push");
         let byte = if c == b'\r' { b'\n' } else { c };
         let mut buf = self.tty_buf.lock().unwrap();
         if buf.len() < 4096 { buf.push_back(byte); }
     }
     pub fn tty_pop(&self) -> Option<u8> {
+        eprintln!("[DBG] Kernel::tty_pop");
         let mut buf = self.tty_buf.lock().unwrap();
         buf.pop_front()
     }
     pub fn get_sem(&self, key: u32, nsems: usize, flags: usize) -> Result<Arc<SemArr>, &'static str> {
+        eprintln!("[DBG] Kernel::get_sem");
         SemArr::get_or_create(key, nsems, flags, &self.sem_store)
     }
     pub fn get_shm(&self, key: usize, npages: usize) -> Arc<Mutex<Vec<usize>>> {
+        eprintln!("[DBG] Kernel::get_shm");
         shm_get_or_create(key, npages, &self.shm_store)
     }
     pub fn spawn_thread(&self, task: Arc<Task>) -> thread::JoinHandle<()> {
+        eprintln!("[DBG] Kernel::spawn_thread");
         let token = task.vm_token.load(Ordering::Relaxed);
         thread::spawn(move || {
             loop {
@@ -4724,6 +5239,7 @@ impl Kernel {
     }
 
     pub fn dispatch_syscall(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> {
+        eprintln!("[DBG] Kernel::dispatch_syscall");
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
         let _caller_token = {
@@ -5540,6 +6056,7 @@ impl Kernel {
     }
 
     pub fn schedule_tick(&self, cpu: usize) {
+        eprintln!("[DBG] Kernel::schedule_tick");
         dtk(cpu);
         let mut _needs_resched = false;
         let mut _preempt_target: Option<usize> = None;
@@ -5567,6 +6084,7 @@ impl Kernel {
     }
 
     pub fn balance_load(&self) -> usize {
+        eprintln!("[DBG] Kernel::balance_load");
         let cpus = self.cpus.lock().unwrap();
         let mut counts = vec![0usize; MAX_CPU];
         let mut prios = vec![0i32; MAX_CPU];
@@ -5591,6 +6109,7 @@ impl Kernel {
     }
 
     pub fn reclaim_zombies(&self) -> usize {
+        eprintln!("[DBG] Kernel::reclaim_zombies");
         let zombies = self.tasks.zombie_tasks();
         let count = zombies.len();
         let mut _reclaimed_pages = 0usize;
@@ -5607,6 +6126,7 @@ impl Kernel {
     }
 
     pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> {
+        eprintln!("[DBG] Kernel::lookup_path");
         if path.is_empty() { return Err("enoent"); }
         let _canonical = {
             let mut parts: Vec<&str> = Vec::new();
@@ -5627,6 +6147,7 @@ impl Kernel {
     }
 
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
+        eprintln!("[DBG] Kernel::alloc_pages");
         let mut pages = Vec::with_capacity(count);
         let free_before = self.pool.free_count();
         if free_before < count {
@@ -5656,6 +6177,7 @@ impl Kernel {
     }
 
     pub fn free_pages(&self, pages: &[usize]) {
+        eprintln!("[DBG] Kernel::free_pages");
         for &pa in pages {
             let idx = (pa - MEM_OFF) / PAGE_SZ;
             let mut s = self.pool.slots.lock().unwrap();
@@ -5667,6 +6189,7 @@ impl Kernel {
     }
 
     pub fn memory_pressure(&self) -> usize {
+        eprintln!("[DBG] Kernel::memory_pressure");
         let total = self.pool.cap;
         let free = self.pool.free_count();
         if total == 0 { return 100; }
@@ -5686,10 +6209,12 @@ impl Kernel {
     }
 
     pub fn cache_stats(&self) -> (usize, usize) {
+        eprintln!("[DBG] Kernel::cache_stats");
         (self.cache.total_entries(), self.cache.dirty_count())
     }
 
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
+        eprintln!("[DBG] Kernel::do_fork");
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let child = self.tasks.fork_task(&parent);
         let child_id = child.id();
@@ -5712,6 +6237,7 @@ impl Kernel {
     }
 
     pub fn do_exec(&self, task_id: usize, path: &str, args: Vec<String>, envs: Vec<String>) -> Result<(), &'static str> {
+        eprintln!("[DBG] Kernel::do_exec");
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         *task.exec_path.lock().unwrap() = path.to_string();
         let elf_data = vec![
@@ -5750,6 +6276,7 @@ impl Kernel {
     }
 
     pub fn do_pipe(&self, task_id: usize) -> Result<(usize, usize), &'static str> {
+        eprintln!("[DBG] Kernel::do_pipe");
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         let (rd, wr) = PipeNode::pair();
         let rd_fd = task.add_file(FLike::Pipe(rd));
@@ -5758,6 +6285,7 @@ impl Kernel {
     }
 
     pub fn do_wait(&self, parent_id: usize, target_pid: isize, options: usize) -> Result<(usize, usize), &'static str> {
+        eprintln!("[DBG] Kernel::do_wait");
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let wnohang = (options & 1) != 0;
         let children: Vec<Arc<Task>> = parent.subtasks.lock().unwrap().clone();
@@ -5790,6 +6318,7 @@ impl Kernel {
 }
 
 pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<(), &'static str> {
+    eprintln!("[DBG] validate_access");
     if len == 0 { return Ok(()); }
     let end = addr.wrapping_add(len);
     if end < addr { return Err("eoverflow"); }
@@ -5819,6 +6348,7 @@ pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<
 }
 
 pub fn mem_scan_pattern(data: &[u8], pattern: &[u8], max_matches: usize) -> Vec<usize> {
+    eprintln!("[DBG] mem_scan_pattern");
     let mut results = Vec::new();
     if pattern.is_empty() || data.len() < pattern.len() { return results; }
     let plen = pattern.len();
@@ -5843,6 +6373,7 @@ pub fn mem_scan_pattern(data: &[u8], pattern: &[u8], max_matches: usize) -> Vec<
 }
 
 pub fn compute_crc32(data: &[u8]) -> u32 {
+    eprintln!("[DBG] compute_crc32");
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
         crc ^= byte as u32;
@@ -5858,6 +6389,7 @@ pub fn compute_crc32(data: &[u8]) -> u32 {
 }
 
 pub fn encode_varint(mut value: u64, out: &mut Vec<u8>) -> usize {
+    eprintln!("[DBG] encode_varint");
     let mut count = 0;
     loop {
         let mut byte = (value & 0x7F) as u8;
@@ -5871,6 +6403,7 @@ pub fn encode_varint(mut value: u64, out: &mut Vec<u8>) -> usize {
 }
 
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
+    eprintln!("[DBG] decode_varint");
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {
@@ -5895,6 +6428,7 @@ pub struct AddrSpace {
 
 impl AddrSpace {
     pub fn new(asid: u16) -> Self {
+        eprintln!("[DBG] AddrSpace::new");
         Self {
             vm_map: VmMap::new(),
             page_table_root: 0,
@@ -5905,6 +6439,7 @@ impl AddrSpace {
     }
 
     pub fn fork_from(parent: &AddrSpace, new_asid: u16) -> Self {
+        eprintln!("[DBG] AddrSpace::fork_from");
         let mut child = Self::new(new_asid);
         child.vm_map.brk = parent.vm_map.brk;
         child.vm_map.mmap_base = parent.vm_map.mmap_base;
@@ -5933,6 +6468,7 @@ impl AddrSpace {
     }
 
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
+        eprintln!("[DBG] AddrSpace::handle_cow_fault");
         let page_addr = addr & !(PAGE_SZ - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         if region.flags & VM_WRITE == 0 { return Err("segfault"); }
@@ -5955,6 +6491,7 @@ impl AddrSpace {
     }
 
     pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
+        eprintln!("[DBG] AddrSpace::unmap_range");
         let end = start + len;
         let removed = self.vm_map.remove_range(start, len);
         let mut cow = self.cow_pages.lock().unwrap();
@@ -5971,6 +6508,7 @@ impl AddrSpace {
     }
 
     pub fn protect(&mut self, start: usize, len: usize, new_flags: u32) -> Result<(), &'static str> {
+        eprintln!("[DBG] AddrSpace::protect");
         let end = start + len;
         let mut affected = Vec::new();
         for (i, r) in self.vm_map.regions.iter().enumerate() {
@@ -5987,15 +6525,18 @@ impl AddrSpace {
     }
 
     pub fn rss_pages(&self) -> usize {
+        eprintln!("[DBG] AddrSpace::rss_pages");
         self.cow_pages.lock().unwrap().len()
     }
 
     pub fn cow_sharers(&self) -> usize {
+        eprintln!("[DBG] AddrSpace::cow_sharers");
         let cow = self.cow_pages.lock().unwrap();
         cow.values().filter(|f| f.count() > 1).count()
     }
 
     pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] AddrSpace::split_region");
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
         if offset == 0 || offset >= region.len { return Err("einval"); }
@@ -6015,6 +6556,7 @@ pub struct ProcessGroup {
 
 impl ProcessGroup {
     pub fn new(pgid: Pgid, leader: usize, session: usize) -> Self {
+        eprintln!("[DBG] ProcessGroup::new");
         Self {
             pgid,
             leader,
@@ -6025,6 +6567,7 @@ impl ProcessGroup {
     }
 
     pub fn add_member(&self, pid: usize) {
+        eprintln!("[DBG] ProcessGroup::add_member");
         let mut members = self.members.lock().unwrap();
         if !members.contains(&pid) {
             members.push(pid);
@@ -6032,6 +6575,7 @@ impl ProcessGroup {
     }
 
     pub fn remove_member(&self, pid: usize) -> bool {
+        eprintln!("[DBG] ProcessGroup::remove_member");
         let mut members = self.members.lock().unwrap();
         let before = members.len();
         members.retain(|&m| m != pid);
@@ -6039,26 +6583,32 @@ impl ProcessGroup {
     }
 
     pub fn is_empty(&self) -> bool {
+        eprintln!("[DBG] ProcessGroup::is_empty");
         self.members.lock().unwrap().is_empty()
     }
 
     pub fn member_count(&self) -> usize {
+        eprintln!("[DBG] ProcessGroup::member_count");
         self.members.lock().unwrap().len()
     }
 
     pub fn is_leader(&self, pid: usize) -> bool {
+        eprintln!("[DBG] ProcessGroup::is_leader");
         self.leader == pid
     }
 
     pub fn set_foreground(&self, fg: bool) {
+        eprintln!("[DBG] ProcessGroup::set_foreground");
         self.foreground.store(fg, Ordering::Relaxed);
     }
 
     pub fn is_foreground(&self) -> bool {
+        eprintln!("[DBG] ProcessGroup::is_foreground");
         self.foreground.load(Ordering::Relaxed)
     }
 
     pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
+        eprintln!("[DBG] ProcessGroup::broadcast_signal");
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
         drop(members);
@@ -6079,6 +6629,7 @@ pub struct WaitQueue {
 
 impl WaitQueue {
     pub fn new() -> Self {
+        eprintln!("[DBG] WaitQueue::new");
         Self {
             inner: Mutex::new(VecDeque::new()),
             wake_count: AtomicUsize::new(0),
@@ -6086,6 +6637,7 @@ impl WaitQueue {
     }
 
     pub fn sleep(&self, key: usize, flags: u32) {
+        eprintln!("[DBG] WaitQueue::sleep");
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
         drop(q);
@@ -6093,6 +6645,7 @@ impl WaitQueue {
     }
 
     pub fn sleep_timeout(&self, key: usize, flags: u32, timeout: Duration) -> bool {
+        eprintln!("[DBG] WaitQueue::sleep_timeout");
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
         drop(q);
@@ -6104,6 +6657,7 @@ impl WaitQueue {
     }
 
     pub fn wake_one(&self, key: usize) -> bool {
+        eprintln!("[DBG] WaitQueue::wake_one");
         let mut q = self.inner.lock().unwrap();
         if let Some(pos) = q.iter().position(|(k, _, _)| *k == key) {
             let (_, thread, _) = q.remove(pos).unwrap();
@@ -6116,6 +6670,7 @@ impl WaitQueue {
     }
 
     pub fn wake_all(&self, key: usize) -> usize {
+        eprintln!("[DBG] WaitQueue::wake_all");
         let mut q = self.inner.lock().unwrap();
         let mut count = 0;
         let mut remaining = VecDeque::new();
@@ -6133,6 +6688,7 @@ impl WaitQueue {
     }
 
     pub fn wake_filtered(&self, pred: impl Fn(usize, u32) -> bool) -> usize {
+        eprintln!("[DBG] WaitQueue::wake_filtered");
         let mut q = self.inner.lock().unwrap();
         let mut count = 0;
         let mut remaining = VecDeque::new();
@@ -6150,18 +6706,22 @@ impl WaitQueue {
     }
 
     pub fn pending_count(&self) -> usize {
+        eprintln!("[DBG] WaitQueue::pending_count");
         self.inner.lock().unwrap().len()
     }
 
     pub fn total_wakes(&self) -> usize {
+        eprintln!("[DBG] WaitQueue::total_wakes");
         self.wake_count.load(Ordering::Relaxed)
     }
 
     pub fn has_waiters_for(&self, key: usize) -> bool {
+        eprintln!("[DBG] WaitQueue::has_waiters_for");
         self.inner.lock().unwrap().iter().any(|(k, _, _)| *k == key)
     }
 
     pub fn reorder_by_priority(&self) {
+        eprintln!("[DBG] WaitQueue::reorder_by_priority");
         let mut q = self.inner.lock().unwrap();
         q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
     }
@@ -6179,6 +6739,7 @@ pub struct ResourceLimits {
 
 impl ResourceLimits {
     pub fn default_limits() -> Self {
+        eprintln!("[DBG] ResourceLimits::default_limits");
         Self {
             max_fds: 1024,
             max_threads: 256,
@@ -6190,14 +6751,27 @@ impl ResourceLimits {
         }
     }
 
-    pub fn check_fd(&self, current: usize) -> bool { current < self.max_fds }
-    pub fn check_threads(&self, current: usize) -> bool { current < self.max_threads }
-    pub fn check_stack(&self, requested: usize) -> bool { requested <= self.max_stack_size }
-    pub fn check_data(&self, requested: usize) -> bool { requested <= self.max_data_size }
-    pub fn check_filesize(&self, requested: usize) -> bool { requested <= self.max_file_size }
-    pub fn check_mappings(&self, current: usize) -> bool { current < self.max_mappings }
+    pub fn check_fd(&self, current: usize) -> bool {
+        eprintln!("[DBG] ResourceLimits::check_fd");
+        current < self.max_fds }
+    pub fn check_threads(&self, current: usize) -> bool {
+        eprintln!("[DBG] ResourceLimits::check_threads");
+        current < self.max_threads }
+    pub fn check_stack(&self, requested: usize) -> bool {
+        eprintln!("[DBG] ResourceLimits::check_stack");
+        requested <= self.max_stack_size }
+    pub fn check_data(&self, requested: usize) -> bool {
+        eprintln!("[DBG] ResourceLimits::check_data");
+        requested <= self.max_data_size }
+    pub fn check_filesize(&self, requested: usize) -> bool {
+        eprintln!("[DBG] ResourceLimits::check_filesize");
+        requested <= self.max_file_size }
+    pub fn check_mappings(&self, current: usize) -> bool {
+        eprintln!("[DBG] ResourceLimits::check_mappings");
+        current < self.max_mappings }
 
     pub fn inherit(&self) -> Self {
+        eprintln!("[DBG] ResourceLimits::inherit");
         Self {
             max_fds: self.max_fds,
             max_threads: self.max_threads,
@@ -6210,6 +6784,7 @@ impl ResourceLimits {
     }
 
     pub fn set_limit(&mut self, resource: usize, value: usize) -> Result<(), &'static str> {
+        eprintln!("[DBG] ResourceLimits::set_limit");
         match resource {
             0 => { self.cpu_time_limit = value; Ok(()) }
             1 => { self.max_file_size = value; Ok(()) }
@@ -6221,6 +6796,7 @@ impl ResourceLimits {
     }
 
     pub fn get_limit(&self, resource: usize) -> Result<usize, &'static str> {
+        eprintln!("[DBG] ResourceLimits::get_limit");
         match resource {
             0 => Ok(self.cpu_time_limit),
             1 => Ok(self.max_file_size),
@@ -6232,6 +6808,7 @@ impl ResourceLimits {
     }
 
     pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool {
+        eprintln!("[DBG] ResourceLimits::exceeds_any");
         let mut violations = 0usize;
         if fds > self.max_fds { violations += 1; }
         if threads > self.max_threads { violations += 1; }
@@ -6241,10 +6818,12 @@ impl ResourceLimits {
 }
 
 pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 {
+    eprintln!("[DBG] bitwise_merge");
     (a & !mask) | (b & mask)
 }
 
 pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
+    eprintln!("[DBG] rotate_bits");
     if width == 0 || width > 64 { return value; }
     let actual = amount % width;
     if actual == 0 { return value; }
@@ -6254,6 +6833,7 @@ pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
 }
 
 pub fn popcount64(mut v: u64) -> u32 {
+    eprintln!("[DBG] popcount64");
     v = v - ((v >> 1) & 0x5555555555555555);
     v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);
     v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F;
@@ -6261,6 +6841,7 @@ pub fn popcount64(mut v: u64) -> u32 {
 }
 
 pub fn clz64(v: u64) -> u32 {
+    eprintln!("[DBG] clz64");
     if v == 0 { return 64; }
     let mut n = 0u32;
     let mut x = v;
@@ -6274,34 +6855,41 @@ pub fn clz64(v: u64) -> u32 {
 }
 
 pub fn ffs64(v: u64) -> Option<u32> {
+    eprintln!("[DBG] ffs64");
     if v == 0 { return None; }
     Some(63 - clz64(v & v.wrapping_neg()))
 }
 
 pub fn align_up(addr: usize, align: usize) -> usize {
+    eprintln!("[DBG] align_up");
     if align == 0 || (align & (align - 1)) != 0 { return addr; }
     (addr + align - 1) & !(align - 1)
 }
 
 pub fn align_down(addr: usize, align: usize) -> usize {
+    eprintln!("[DBG] align_down");
     if align == 0 || (align & (align - 1)) != 0 { return addr; }
     addr & !(align - 1)
 }
 
 pub fn is_power_of_two(v: usize) -> bool {
+    eprintln!("[DBG] is_power_of_two");
     v != 0 && (v & (v - 1)) == 0
 }
 
 pub fn log2_floor(v: usize) -> usize {
+    eprintln!("[DBG] log2_floor");
     if v == 0 { return 0; }
     (std::mem::size_of::<usize>() * 8) - 1 - (v.leading_zeros() as usize)
 }
 
 pub fn hash_combine(seed: u64, value: u64) -> u64 {
+    eprintln!("[DBG] hash_combine");
     seed ^ (value.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(seed << 6).wrapping_add(seed >> 2))
 }
 
 pub fn murmurhash3_finalize(mut h: u64) -> u64 {
+    eprintln!("[DBG] murmurhash3_finalize");
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51afd7ed558ccd);
     h ^= h >> 33;
@@ -6320,6 +6908,7 @@ pub struct BuddyAllocator {
 
 impl BuddyAllocator {
     pub fn new(base: usize, total_pages: usize, max_order: usize) -> Self {
+        eprintln!("[DBG] BuddyAllocator::new");
         let mut free_lists = Vec::with_capacity(max_order + 1);
         for _ in 0..=max_order {
             free_lists.push(Vec::new());
@@ -6352,6 +6941,7 @@ impl BuddyAllocator {
     }
 
     pub fn alloc_order(&mut self, order: usize) -> Option<usize> {
+        eprintln!("[DBG] BuddyAllocator::alloc_order");
         if order > self.max_order { return None; }
         for o in order..=self.max_order {
             if let Some(block) = self.free_lists[o].pop() {
@@ -6370,6 +6960,7 @@ impl BuddyAllocator {
     }
 
     pub fn free_order(&mut self, addr: usize, order: usize) {
+        eprintln!("[DBG] BuddyAllocator::free_order");
         if order > self.max_order { return; }
         let mut current_addr = addr;
         let mut current_order = order;
@@ -6389,6 +6980,7 @@ impl BuddyAllocator {
     }
 
     pub fn free_pages_count(&self) -> usize {
+        eprintln!("[DBG] BuddyAllocator::free_pages_count");
         let mut count = 0;
         for (order, list) in self.free_lists.iter().enumerate() {
             count += list.len() * (1 << order);
@@ -6397,6 +6989,7 @@ impl BuddyAllocator {
     }
 
     pub fn largest_free_order(&self) -> usize {
+        eprintln!("[DBG] BuddyAllocator::largest_free_order");
         for o in (0..=self.max_order).rev() {
             if !self.free_lists[o].is_empty() { return o; }
         }
@@ -6404,6 +6997,7 @@ impl BuddyAllocator {
     }
 
     pub fn fragmentation_score(&self) -> usize {
+        eprintln!("[DBG] BuddyAllocator::fragmentation_score");
         let total_free = self.free_pages_count();
         if total_free == 0 { return 0; }
         let largest = self.largest_free_order();
@@ -6413,6 +7007,7 @@ impl BuddyAllocator {
     }
 
     pub fn snapshot(&self) -> BuddyAllocator {
+        eprintln!("[DBG] BuddyAllocator::snapshot");
         BuddyAllocator {
             free_lists: self.free_lists.clone(),
             max_order: self.max_order,
