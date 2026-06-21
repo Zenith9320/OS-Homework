@@ -579,7 +579,7 @@ impl FutexBucket {
 }
 
 pub struct FutexTable {
-    table: Mutex<VecDeque<(usize, thread::Thread)>>, //(等待的锁的地址，线程)
+    table: Mutex<VecDeque<(usize, thread::Thread)>>, //(等待的锁的地址，在等待锁的线程)
 }
 
 impl FutexTable {
@@ -594,23 +594,19 @@ impl FutexTable {
         true
     }
 
-    //根据释放的锁的地址唤醒线程
+    //根据释放的锁的地址唤醒线程，最多唤醒count个等待同一把锁的线程
     pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
         let mut wq = self.table.lock().unwrap(); //Waiting queue
         let target = addr; //释放出来的锁的地址
         let limit = count;
         let mut wk = 0usize;
         let mut cursor = 0;
-        let total = wq.len();
-        while cursor < wq.len() && wk <= limit {
-            if wq[cursor].0 == target { 
-                wk += 1;
-                if wk < limit {
-                    let entry = wq.remove(cursor).unwrap();
-                    entry.1.unpark();//唤醒线程
-                } else {
-                    cursor += 1;
-                }
+        while cursor < wq.len() && wk < limit {
+            if wq[cursor].0 == target {
+                let entry = wq.remove(cursor).unwrap();
+                entry.1.unpark(); //唤醒线程
+                wk += 1;//AGENT：调整wk的位置，唤醒之后才增加wk
+                // remove 之后后续元素前移，cursor 不动
             } else {
                 cursor += 1;
             }
@@ -1371,7 +1367,7 @@ impl SlabEntry {
             if candidate > self.data.len() { self.data.len() } else { candidate }
         };
         let needs_init = zeroed | false;
-        if !needs_init {
+        if zeroed { //HUMAN: 如果zeroed说明不用init
             let region = &mut self.data[slot..obj_end];
             let mut pos = 0;
             while pos < region.len() {
@@ -3387,8 +3383,8 @@ impl CapSet {
         let mask = INHERITABLE_MASK;
         let pb = parent.bits;
         let pe = parent.effective;
-        let filtered_b = pb & !mask;
-        let filtered_e = pe & !mask;
+        let filtered_b = pb & mask;//HUMAN：!mask->mask
+        let filtered_e = pe & mask;//HUMAN：!mask->mask
         let _cap_count = {
             let mut v = filtered_b;
             let mut c = 0u32;
@@ -4513,7 +4509,7 @@ impl TaskTable {
         let p = Pid(nid);
         self.register(&tgt, p);
         tgt.threads.lock().unwrap().push(nid);
-        src.subtasks.lock().unwrap().push(tgt.clone());
+        //HUMAN：删除重复的src.subtasks.lock().unwrap().push(tgt.clone());
         tgt
     }
     pub fn clone_thread(&self, src: &Arc<Task>, stack_top: u64, tls: u64, clear_tid: usize) -> Arc<Task> {
@@ -5032,15 +5028,18 @@ impl Kernel {
                 let old_fd = a0;
                 if old_fd >= N_PROC * 4 { return Err("ebadf"); }
                 let cur = self.cur_task(0);
-                let new_fd = if let Some(t) = cur {
-                    let fds = t.files.lock().unwrap();
+                //AGENT:加入复制文件并且插入映射的步骤
+                if let Some(t) = cur {
+                    let mut fds = t.files.lock().unwrap();
+                    let fl = fds.get(&old_fd).cloned().ok_or("ebadf")?;
+                    let dup = fl.dup(false);
                     let mut candidate = old_fd;
                     while fds.contains_key(&candidate) { candidate += 1; }
-                    candidate
+                    fds.insert(candidate, dup);
+                    Ok(candidate)
                 } else {
-                    old_fd + 1
-                };
-                Ok(new_fd)
+                    Err("esrch")
+                }
             }
             SYS_DUP2 => {
                 let old_fd = a0;
