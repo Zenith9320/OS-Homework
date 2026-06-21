@@ -226,7 +226,12 @@ impl KernLock {
         if f {
             eprintln!("[DBG] KernLock::enter SPIN_WAIT id={} flag=true holder={} tid={}", id, h, tid);
         }
+        let mut spin_cnt: u64 = 0;
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            spin_cnt += 1;
+            if spin_cnt % 10_000_000 == 1 {
+                eprintln!("[DBG] KernLock::enter SPINNING id={} cnt={} holder={} tid={}", id, spin_cnt, self.holder.load(Ordering::Relaxed), tid);
+            }
             core::hint::spin_loop();
         }
         eprintln!("[DBG] KernLock::enter ACQUIRED id={} holder:{}→{} depth:{}→1 tid={}", id, h, id, d, tid);
@@ -1095,8 +1100,10 @@ impl FramePool {
         r
     }
     pub fn get_inner(&self) -> Option<usize> {
-        eprintln!("[DBG] FramePool::get_inner");
+        let tid = format!("{:?}", std::thread::current().id());
+        eprintln!("[DBG] FramePool::get_inner locking slots... tid={}", tid);
         let mut s = self.slots.lock().unwrap();
+        eprintln!("[DBG] FramePool::get_inner slots locked tid={}", tid);
         for (i, f) in s.iter_mut().enumerate() {
             if *f { *f = false; return Some(i); }
         }
@@ -2975,7 +2982,12 @@ impl BlockCache {
         if lk_before {
             eprintln!("[DBG] BlockCache::fetch chain[{}] SPIN_WAIT lk=true tid={}", ci, tid);
         }
+        let mut fetch_spin: u64 = 0;
         while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            fetch_spin += 1;
+            if fetch_spin % 10_000_000 == 1 {
+                eprintln!("[DBG] BlockCache::fetch chain[{}] SPINNING cnt={} tid={}", ci, fetch_spin, tid);
+            }
             core::hint::spin_loop();
         }
         eprintln!("[DBG] BlockCache::fetch chain[{}] acquired lk tid={}", ci, tid);
@@ -3032,7 +3044,12 @@ impl BlockCache {
             GKL.depth.fetch_add(1, Ordering::Relaxed);
         } else {
             eprintln!("[DBG] BlockCache::sync_all acquiring GKL...");
+            let mut gkl_spin: u64 = 0;
             while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                gkl_spin += 1;
+                if gkl_spin % 10_000_000 == 1 {
+                    eprintln!("[DBG] BlockCache::sync_all SPINNING for GKL cnt={} holder={}", gkl_spin, GKL.holder.load(Ordering::Relaxed));
+                }
                 core::hint::spin_loop();
             }
             eprintln!("[DBG] BlockCache::sync_all GKL acquired, holder→{} depth→1", id);
@@ -3046,7 +3063,12 @@ impl BlockCache {
             if lk_before {
                 eprintln!("[DBG] BlockCache::sync_all chain[{}] SPIN_WAIT lk=true", chain_idx);
             }
+            let mut spin_cnt: u64 = 0;
             while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                spin_cnt += 1;
+                if spin_cnt % 10_000_000 == 1 {
+                    eprintln!("[DBG] BlockCache::sync_all chain[{}] SPINNING cnt={}", chain_idx, spin_cnt);
+                }
                 core::hint::spin_loop();
             }
             eprintln!("[DBG] BlockCache::sync_all chain[{}] acquired lk", chain_idx);
@@ -5177,7 +5199,14 @@ impl Kernel {
             GKL.depth.fetch_add(1, Ordering::Relaxed);
         } else {
             eprintln!("[DBG] Kernel::tick acquiring GKL...");
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
+            let mut gkl_spin: u64 = 0;
+            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                gkl_spin += 1;
+                if gkl_spin % 10_000_000 == 1 {
+                    eprintln!("[DBG] Kernel::tick SPINNING for GKL cnt={} holder={}", gkl_spin, GKL.holder.load(Ordering::Relaxed));
+                }
+                core::hint::spin_loop();
+            }
             eprintln!("[DBG] Kernel::tick GKL acquired, holder→{} depth→1", id);
             GKL.holder.store(id, Ordering::Relaxed);
             GKL.depth.store(1, Ordering::Relaxed);
@@ -5199,7 +5228,14 @@ impl Kernel {
                 if lk_before {
                     eprintln!("[DBG] Kernel::tick chain[{}] SPIN_WAIT lk=true", ci);
                 }
-                while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
+                let mut spin_cnt: u64 = 0;
+                while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                    spin_cnt += 1;
+                    if spin_cnt % 10_000_000 == 1 {
+                        eprintln!("[DBG] Kernel::tick chain[{}] SPINNING cnt={}", ci, spin_cnt);
+                    }
+                    core::hint::spin_loop();
+                }
                 { let mut items = ch.items.lock().unwrap(); for s in items.iter_mut() { s.modified = false; } }
                 ch.lk.v.store(false, Ordering::Release);
             }
