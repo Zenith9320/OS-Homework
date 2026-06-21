@@ -207,19 +207,28 @@ pub struct KernLock {
     flag: AtomicBool,
     holder: AtomicUsize,
     depth: AtomicUsize,
+    owner_tid: AtomicU64, // BUGFIX: 用线程ID追踪真正的持有者，支持同线程不同id的可重入
 }
 impl KernLock {
     pub const fn new() -> Self {
-        Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
+        Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0), owner_tid: AtomicU64::new(0) }
+    }
+    fn current_tid_u64() -> u64 {
+        // BUGFIX: 获取当前线程ID的u64表示，用于可重入判断
+        unsafe { std::mem::transmute(std::thread::current().id()) }
     }
     pub fn enter(&self, id: usize) {
+        let cur_tid = Self::current_tid_u64();
+        let owner = self.owner_tid.load(Ordering::Relaxed);
         let h = self.holder.load(Ordering::Relaxed);
         let d = self.depth.load(Ordering::Relaxed);
         let f = self.flag.load(Ordering::Relaxed);
         let tid = format!("{:?}", std::thread::current().id());
-        eprintln!("[DBG] KernLock::enter id={} holder={} depth={} flag={} tid={}", id, h, d, f, tid);
-        if h == id && id != 0 {
-            eprintln!("[DBG] KernLock::enter REENTRANT id={} depth:{}→{} tid={}", id, d, d+1, tid);
+        eprintln!("[DBG] KernLock::enter id={} holder={} depth={} flag={} owner_tid={} cur_tid={} tid={}", id, h, d, f, owner, cur_tid, tid);
+        // BUGFIX: 通过owner_tid判断是否同线程可重入，而非holder==id
+        // 这样同线程使用不同id（如外层1003、内层1004）也能正确重入
+        if owner == cur_tid && id != 0 {
+            eprintln!("[DBG] KernLock::enter REENTRANT (same thread) id={} depth:{}→{} tid={}", id, d, d+1, tid);
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -237,6 +246,7 @@ impl KernLock {
         eprintln!("[DBG] KernLock::enter ACQUIRED id={} holder:{}→{} depth:{}→1 tid={}", id, h, id, d, tid);
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
+        self.owner_tid.store(cur_tid, Ordering::Relaxed); // BUGFIX: 记录持有者线程ID
     }
     pub fn leave(&self) {
         let d = self.depth.load(Ordering::Relaxed);
@@ -251,6 +261,7 @@ impl KernLock {
         eprintln!("[DBG] KernLock::leave RELEASE holder:{}→0 depth:{}→0 flag→false tid={}", h, d, tid);
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
+        self.owner_tid.store(0, Ordering::Relaxed); // BUGFIX: 清除持有者线程ID
         self.flag.store(false, Ordering::Release);
     }
     pub fn held(&self) -> bool {
@@ -1094,6 +1105,8 @@ impl FramePool {
         Self { slots: Mutex::new(vec![true; n]), cap: n } }
     pub fn get(&self, id: usize) -> Option<usize> {
         eprintln!("[DBG] FramePool::get");
+        // BUGFIX: GKL由调用者管理，FramePool内部不重复获取。
+        // 如果这里调用GKL.enter(id)，会与调用者已经持有的GKL产生id不匹配的死锁。
         //HUMAN: GKL.enter(id);
         let r = self.get_inner();
         //HUMAN: GKL.leave();
@@ -3035,27 +3048,10 @@ impl BlockCache {
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {
-        let gkl_h = GKL.holder.load(Ordering::Relaxed);
-        let gkl_d = GKL.depth.load(Ordering::Relaxed);
-        let gkl_f = GKL.flag.load(Ordering::Relaxed);
-        eprintln!("[DBG] BlockCache::sync_all id={} GKL(holder={} depth={} flag={}) nchains={}", id, gkl_h, gkl_d, gkl_f, self.chains.len());
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            eprintln!("[DBG] BlockCache::sync_all GKL reentrant id={} depth:{}→{}", id, gkl_d, gkl_d+1);
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            eprintln!("[DBG] BlockCache::sync_all acquiring GKL...");
-            let mut gkl_spin: u64 = 0;
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                gkl_spin += 1;
-                if gkl_spin % 10_000_000 == 1 {
-                    eprintln!("[DBG] BlockCache::sync_all SPINNING for GKL cnt={} holder={}", gkl_spin, GKL.holder.load(Ordering::Relaxed));
-                }
-                core::hint::spin_loop();
-            }
-            eprintln!("[DBG] BlockCache::sync_all GKL acquired, holder→{} depth→1", id);
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        eprintln!("[DBG] BlockCache::sync_all id={} nchains={}", id, self.chains.len());
+        // BUGFIX: 改为调用GKL.enter/GKL.leave，不再内联操作GKL字段。
+        // 原来的内联代码在释放时无条件depth=0，破坏了可重入锁的深度计数。
+        GKL.enter(id);
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
@@ -3083,18 +3079,8 @@ impl BlockCache {
             }
             ch.lk.v.store(false, Ordering::Release);
         }
-        let d = GKL.depth.load(Ordering::Relaxed);
-        let h = GKL.holder.load(Ordering::Relaxed);
-        eprintln!("[DBG] BlockCache::sync_all done synced={} GKL(holder={} depth={})", synced, h, d);
-        if d > 1 {
-            eprintln!("[DBG] BlockCache::sync_all GKL DECR depth:{}→{}", d, d-1);
-            GKL.depth.store(d - 1, Ordering::Relaxed);
-        } else {
-            eprintln!("[DBG] BlockCache::sync_all GKL RELEASE");
-            GKL.holder.store(0, Ordering::Relaxed);
-            GKL.depth.store(0, Ordering::Relaxed);
-            GKL.flag.store(false, Ordering::Release);
-        }
+        eprintln!("[DBG] BlockCache::sync_all done synced={}", synced);
+        GKL.leave(); // BUGFIX: 统一使用GKL.leave()，正确处理可重入深度
     }
 
     pub fn invalidate(&self, k: usize) {
@@ -5190,27 +5176,10 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
-        let gkl_h = GKL.holder.load(Ordering::Relaxed);
-        let gkl_d = GKL.depth.load(Ordering::Relaxed);
-        let gkl_f = GKL.flag.load(Ordering::Relaxed);
-        eprintln!("[DBG] Kernel::tick id={} GKL(holder={} depth={} flag={}) nchains={}", id, gkl_h, gkl_d, gkl_f, self.cache.chains.len());
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            eprintln!("[DBG] Kernel::tick GKL reentrant id={} depth:{}→{}", id, gkl_d, gkl_d+1);
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            eprintln!("[DBG] Kernel::tick acquiring GKL...");
-            let mut gkl_spin: u64 = 0;
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                gkl_spin += 1;
-                if gkl_spin % 10_000_000 == 1 {
-                    eprintln!("[DBG] Kernel::tick SPINNING for GKL cnt={} holder={}", gkl_spin, GKL.holder.load(Ordering::Relaxed));
-                }
-                core::hint::spin_loop();
-            }
-            eprintln!("[DBG] Kernel::tick GKL acquired, holder→{} depth→1", id);
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        eprintln!("[DBG] Kernel::tick id={} nchains={}", id, self.cache.chains.len());
+        // BUGFIX: 改为调用GKL.enter/GKL.leave，不再内联操作GKL字段。
+        // 原来的内联代码在释放时无条件depth=0，破坏了可重入锁的深度计数。
+        GKL.enter(id);
         let _ir = {
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
@@ -5240,18 +5209,8 @@ impl Kernel {
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
-        let d = GKL.depth.load(Ordering::Relaxed);
-        let h = GKL.holder.load(Ordering::Relaxed);
-        eprintln!("[DBG] Kernel::tick done GKL(holder={} depth={})", h, d);
-        if d > 1 {
-            eprintln!("[DBG] Kernel::tick GKL DECR depth:{}→{}", d, d-1);
-            GKL.depth.store(d - 1, Ordering::Relaxed);
-        } else {
-            eprintln!("[DBG] Kernel::tick GKL RELEASE");
-            GKL.holder.store(0, Ordering::Relaxed);
-            GKL.depth.store(0, Ordering::Relaxed);
-            GKL.flag.store(false, Ordering::Release);
-        }
+        eprintln!("[DBG] Kernel::tick done");
+        GKL.leave(); // BUGFIX: 统一使用GKL.leave()，正确处理可重入深度
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         eprintln!("[DBG] Kernel::cur_task");
