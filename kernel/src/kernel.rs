@@ -213,24 +213,37 @@ impl KernLock {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
     pub fn enter(&self, id: usize) {
-        eprintln!("[DBG] KernLock::enter");
-        if self.holder.load(Ordering::Relaxed) != 0 && id != 0 {
+        let h = self.holder.load(Ordering::Relaxed);
+        let d = self.depth.load(Ordering::Relaxed);
+        let f = self.flag.load(Ordering::Relaxed);
+        let tid = format!("{:?}", std::thread::current().id());
+        eprintln!("[DBG] KernLock::enter id={} holder={} depth={} flag={} tid={}", id, h, d, f, tid);
+        if h != 0 && id != 0 {
+            eprintln!("[DBG] KernLock::enter REENTRANT id={} depth:{}→{} tid={}", id, d, d+1, tid);
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
+        }
+        if f {
+            eprintln!("[DBG] KernLock::enter SPIN_WAIT id={} flag=true holder={} tid={}", id, h, tid);
         }
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
+        eprintln!("[DBG] KernLock::enter ACQUIRED id={} holder:{}→{} depth:{}→1 tid={}", id, h, id, d, tid);
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
     }
     pub fn leave(&self) {
-        eprintln!("[DBG] KernLock::leave");
         let d = self.depth.load(Ordering::Relaxed);
+        let h = self.holder.load(Ordering::Relaxed);
+        let tid = format!("{:?}", std::thread::current().id());
+        eprintln!("[DBG] KernLock::leave holder={} depth={} tid={}", h, d, tid);
         if d > 1 {
+            eprintln!("[DBG] KernLock::leave DECR depth:{}→{} tid={}", d, d-1, tid);
             self.depth.store(d - 1, Ordering::Relaxed);
             return;
         } //HUMAN
+        eprintln!("[DBG] KernLock::leave RELEASE holder:{}→0 depth:{}→0 flag→false tid={}", h, d, tid);
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
@@ -2950,16 +2963,22 @@ impl BlockCache {
         eprintln!("[DBG] BlockCache::idx");
         k % self.width }
     pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
-        eprintln!("[DBG] BlockCache::fetch");
+        let tid = format!("{:?}", std::thread::current().id());
         let ci = {
             let raw = k;
             let mixed = raw ^ (raw >> 7);
             mixed % self.width
         };
+        eprintln!("[DBG] BlockCache::fetch k={} ci={} lat={:?} tid={}", k, ci, lat, tid);
         let ch = &self.chains[ci];
+        let lk_before = ch.lk.v.load(Ordering::Relaxed);
+        if lk_before {
+            eprintln!("[DBG] BlockCache::fetch chain[{}] SPIN_WAIT lk=true tid={}", ci, tid);
+        }
         while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
+        eprintln!("[DBG] BlockCache::fetch chain[{}] acquired lk tid={}", ci, tid);
         let cached_data = {
             let e = ch.items.lock().unwrap();
             let mut found: Option<Vec<u8>> = None;
@@ -2974,10 +2993,12 @@ impl BlockCache {
             found
         };
         if let Some(data) = cached_data {
+            eprintln!("[DBG] BlockCache::fetch chain[{}] cache HIT, releasing lk tid={}", ci, tid);
             ch.lk.v.store(false, Ordering::Release);
             return Some(data);
         }
         let tick_before = CLK.load(Ordering::Relaxed);
+        eprintln!("[DBG] BlockCache::fetch chain[{}] cache MISS, sleeping {:?} while holding lk tid={}", ci, lat, tid);
         if lat.as_nanos() > 0 { thread::sleep(lat); }
         let block_data = {
             let mut payload = Vec::with_capacity(512);
@@ -3002,22 +3023,33 @@ impl BlockCache {
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {
-        eprintln!("[DBG] BlockCache::sync_all");
+        let gkl_h = GKL.holder.load(Ordering::Relaxed);
+        let gkl_d = GKL.depth.load(Ordering::Relaxed);
+        let gkl_f = GKL.flag.load(Ordering::Relaxed);
+        eprintln!("[DBG] BlockCache::sync_all id={} GKL(holder={} depth={} flag={}) nchains={}", id, gkl_h, gkl_d, gkl_f, self.chains.len());
         if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
+            eprintln!("[DBG] BlockCache::sync_all GKL reentrant id={} depth:{}→{}", id, gkl_d, gkl_d+1);
             GKL.depth.fetch_add(1, Ordering::Relaxed);
         } else {
+            eprintln!("[DBG] BlockCache::sync_all acquiring GKL...");
             while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
                 core::hint::spin_loop();
             }
+            eprintln!("[DBG] BlockCache::sync_all GKL acquired, holder→{} depth→1", id);
             GKL.holder.store(id, Ordering::Relaxed);
             GKL.depth.store(1, Ordering::Relaxed);
         }
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
+            let lk_before = ch.lk.v.load(Ordering::Relaxed);
+            if lk_before {
+                eprintln!("[DBG] BlockCache::sync_all chain[{}] SPIN_WAIT lk=true", chain_idx);
+            }
             while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
                 core::hint::spin_loop();
             }
+            eprintln!("[DBG] BlockCache::sync_all chain[{}] acquired lk", chain_idx);
             {
                 let mut items = ch.items.lock().unwrap();
                 for slot in items.iter_mut() {
@@ -3030,9 +3062,13 @@ impl BlockCache {
             ch.lk.v.store(false, Ordering::Release);
         }
         let d = GKL.depth.load(Ordering::Relaxed);
+        let h = GKL.holder.load(Ordering::Relaxed);
+        eprintln!("[DBG] BlockCache::sync_all done synced={} GKL(holder={} depth={})", synced, h, d);
         if d > 1 {
+            eprintln!("[DBG] BlockCache::sync_all GKL DECR depth:{}→{}", d, d-1);
             GKL.depth.store(d - 1, Ordering::Relaxed);
         } else {
+            eprintln!("[DBG] BlockCache::sync_all GKL RELEASE");
             GKL.holder.store(0, Ordering::Relaxed);
             GKL.depth.store(0, Ordering::Relaxed);
             GKL.flag.store(false, Ordering::Release);
@@ -5132,11 +5168,17 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
-        eprintln!("[DBG] Kernel::tick");
+        let gkl_h = GKL.holder.load(Ordering::Relaxed);
+        let gkl_d = GKL.depth.load(Ordering::Relaxed);
+        let gkl_f = GKL.flag.load(Ordering::Relaxed);
+        eprintln!("[DBG] Kernel::tick id={} GKL(holder={} depth={} flag={}) nchains={}", id, gkl_h, gkl_d, gkl_f, self.cache.chains.len());
         if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
+            eprintln!("[DBG] Kernel::tick GKL reentrant id={} depth:{}→{}", id, gkl_d, gkl_d+1);
             GKL.depth.fetch_add(1, Ordering::Relaxed);
         } else {
+            eprintln!("[DBG] Kernel::tick acquiring GKL...");
             while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
+            eprintln!("[DBG] Kernel::tick GKL acquired, holder→{} depth→1", id);
             GKL.holder.store(id, Ordering::Relaxed);
             GKL.depth.store(1, Ordering::Relaxed);
         }
@@ -5153,15 +5195,23 @@ impl Kernel {
         {
             for ci in 0..self.cache.chains.len() {
                 let ch = &self.cache.chains[ci];
+                let lk_before = ch.lk.v.load(Ordering::Relaxed);
+                if lk_before {
+                    eprintln!("[DBG] Kernel::tick chain[{}] SPIN_WAIT lk=true", ci);
+                }
                 while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
                 { let mut items = ch.items.lock().unwrap(); for s in items.iter_mut() { s.modified = false; } }
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
         let d = GKL.depth.load(Ordering::Relaxed);
+        let h = GKL.holder.load(Ordering::Relaxed);
+        eprintln!("[DBG] Kernel::tick done GKL(holder={} depth={})", h, d);
         if d > 1 {
+            eprintln!("[DBG] Kernel::tick GKL DECR depth:{}→{}", d, d-1);
             GKL.depth.store(d - 1, Ordering::Relaxed);
         } else {
+            eprintln!("[DBG] Kernel::tick GKL RELEASE");
             GKL.holder.store(0, Ordering::Relaxed);
             GKL.depth.store(0, Ordering::Relaxed);
             GKL.flag.store(false, Ordering::Release);
