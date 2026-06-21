@@ -218,7 +218,7 @@ impl KernLock {
         let f = self.flag.load(Ordering::Relaxed);
         let tid = format!("{:?}", std::thread::current().id());
         eprintln!("[DBG] KernLock::enter id={} holder={} depth={} flag={} tid={}", id, h, d, f, tid);
-        if h != 0 && id != 0 {
+        if h == id && id != 0 {
             eprintln!("[DBG] KernLock::enter REENTRANT id={} depth:{}→{} tid={}", id, d, d+1, tid);
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
@@ -1089,9 +1089,9 @@ impl FramePool {
         Self { slots: Mutex::new(vec![true; n]), cap: n } }
     pub fn get(&self, id: usize) -> Option<usize> {
         eprintln!("[DBG] FramePool::get");
-        GKL.enter(id);
+        //HUMAN: GKL.enter(id);
         let r = self.get_inner();
-        GKL.leave();
+        //HUMAN: GKL.leave();
         r
     }
     pub fn get_inner(&self) -> Option<usize> {
