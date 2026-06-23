@@ -214,7 +214,7 @@ impl KernLock {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0), owner_tid: AtomicU64::new(0) }
     }
     fn current_tid_u64() -> u64 {
-        // BUGFIX: 获取当前线程ID的u64表示，用于可重入判断
+        // AGENT: 获取当前线程ID的u64表示，用于可重入判断
         unsafe { std::mem::transmute(std::thread::current().id()) }
     }
     pub fn enter(&self, id: usize) {
@@ -275,13 +275,17 @@ impl KernLock {
         self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, id: usize) -> bool {
         eprintln!("[DBG] KernLock::try_enter");
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        // BUGFIX: 同enter，用线程ID判断可重入
+        let cur_tid = Self::current_tid_u64();
+        let owner = self.owner_tid.load(Ordering::Relaxed);
+        if owner == cur_tid && id != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.holder.store(id, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
+            self.owner_tid.store(cur_tid, Ordering::Relaxed); // BUGFIX: 记录持有者线程ID
             true
         } else {
             false
@@ -429,45 +433,57 @@ impl SyncQueue {
         eprintln!("[DBG] SyncQueue::new");
         Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), epoch: AtomicUsize::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
-        eprintln!("[DBG] SyncQueue::park_on");
+        let tid = format!("{:?}", std::thread::current().id());
+        eprintln!("[DBG] SyncQueue::park_on tid={}", tid);
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
         drop(d);
-        if satisfied { return true; }
+        if satisfied { eprintln!("[DBG] SyncQueue::park_on pred satisfied tid={}", tid); return true; }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
-        if self.epoch.load(Ordering::Relaxed) > 0 {
+        let ep = self.epoch.load(Ordering::Relaxed);
+        if ep > 0 {
             self.epoch.fetch_sub(1, Ordering::Relaxed);
+            eprintln!("[DBG] SyncQueue::park_on consumed epoch {}→{} tid={}", ep, ep-1, tid);
             drop(wq);
             let d = g.lock().unwrap();
             let result = pred(&d);
             drop(d);
+            eprintln!("[DBG] SyncQueue::park_on epoch path result={} tid={}", result, tid);
             return result;
         } //HUMAN
+        eprintln!("[DBG] SyncQueue::park_on PARKING qlen={} tid={}", wq.len(), tid);
         wq.push_back(th);
         drop(wq);
         thread::park(); //睡觉，直到被unpark唤醒之后执行下面的代码
+        eprintln!("[DBG] SyncQueue::park_on WOKE UP tid={}", tid);
         let d = g.lock().unwrap();
         let result = pred(&d); //HUMAN
         drop(d);
+        eprintln!("[DBG] SyncQueue::park_on result={} tid={}", result, tid);
         result
     }
     pub fn signal(&self) {
-        eprintln!("[DBG] SyncQueue::signal");
+        let tid = format!("{:?}", std::thread::current().id());
         let mut q = self.q.lock().unwrap();
+        let qlen = q.len();
+        let ep = self.epoch.load(Ordering::Relaxed);
+        eprintln!("[DBG] SyncQueue::signal qlen={} epoch={} tid={}", qlen, ep, tid);
         match q.len() {
-            0 => { drop(q); self.epoch.fetch_add(1, Ordering::Relaxed); } //HUMAN
-            1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
-            _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
+            0 => { drop(q); self.epoch.fetch_add(1, Ordering::Relaxed); eprintln!("[DBG] SyncQueue::signal no waiters, epoch++ tid={}", tid); } //HUMAN
+            1 => { let t = q.pop_front().unwrap(); drop(q); eprintln!("[DBG] SyncQueue::signal unpark 1 tid={}", tid); t.unpark(); }
+            _ => { let t = q.pop_front().unwrap(); drop(q); eprintln!("[DBG] SyncQueue::signal unpark 1 (multi) tid={}", tid); t.unpark(); }
         }
     }
     pub fn broadcast(&self) {
-        eprintln!("[DBG] SyncQueue::broadcast");
+        let tid = format!("{:?}", std::thread::current().id());
+        eprintln!("[DBG] SyncQueue::broadcast tid={}", tid);
         let mut q = self.q.lock().unwrap();
         let count = q.len();
         let batch: Vec<thread::Thread> = q.drain(..).collect();
         drop(q);
-        if count == 0 { self.epoch.fetch_add(1, Ordering::Relaxed); } //HUMAN
+        if count == 0 { self.epoch.fetch_add(1, Ordering::Relaxed); eprintln!("[DBG] SyncQueue::broadcast no waiters, epoch++ tid={}", tid); } //HUMAN
+        eprintln!("[DBG] SyncQueue::broadcast unparking {} threads tid={}", batch.len(), tid);
         for t in batch { t.unpark(); }
     }
     pub fn signal_n(&self, n: usize) -> usize {
@@ -1136,7 +1152,8 @@ impl FramePool {
         None
     }
     pub fn put(&self, idx: usize) {
-        eprintln!("[DBG] FramePool::put");
+        let tid = format!("{:?}", std::thread::current().id());
+        eprintln!("[DBG] FramePool::put idx={} tid={}", idx, tid);
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() { s[idx] = true; }
     }
@@ -3048,10 +3065,27 @@ impl BlockCache {
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {
-        eprintln!("[DBG] BlockCache::sync_all id={} nchains={}", id, self.chains.len());
-        // BUGFIX: 改为调用GKL.enter/GKL.leave，不再内联操作GKL字段。
-        // 原来的内联代码在释放时无条件depth=0，破坏了可重入锁的深度计数。
-        GKL.enter(id);
+        let gkl_h = GKL.holder.load(Ordering::Relaxed);
+        let gkl_d = GKL.depth.load(Ordering::Relaxed);
+        let gkl_f = GKL.flag.load(Ordering::Relaxed);
+        eprintln!("[DBG] BlockCache::sync_all id={} GKL(holder={} depth={} flag={}) nchains={}", id, gkl_h, gkl_d, gkl_f, self.chains.len());
+        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
+            eprintln!("[DBG] BlockCache::sync_all GKL reentrant id={} depth:{}→{}", id, gkl_d, gkl_d+1);
+            GKL.depth.fetch_add(1, Ordering::Relaxed);
+        } else {
+            eprintln!("[DBG] BlockCache::sync_all acquiring GKL...");
+            let mut gkl_spin: u64 = 0;
+            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                gkl_spin += 1;
+                if gkl_spin % 10_000_000 == 1 {
+                    eprintln!("[DBG] BlockCache::sync_all SPINNING for GKL cnt={} holder={}", gkl_spin, GKL.holder.load(Ordering::Relaxed));
+                }
+                core::hint::spin_loop();
+            }
+            eprintln!("[DBG] BlockCache::sync_all GKL acquired, holder→{} depth→1", id);
+            GKL.holder.store(id, Ordering::Relaxed);
+            GKL.depth.store(1, Ordering::Relaxed);
+        }
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
@@ -3079,8 +3113,18 @@ impl BlockCache {
             }
             ch.lk.v.store(false, Ordering::Release);
         }
-        eprintln!("[DBG] BlockCache::sync_all done synced={}", synced);
-        GKL.leave(); // BUGFIX: 统一使用GKL.leave()，正确处理可重入深度
+        let d = GKL.depth.load(Ordering::Relaxed);
+        let h = GKL.holder.load(Ordering::Relaxed);
+        eprintln!("[DBG] BlockCache::sync_all done synced={} GKL(holder={} depth={})", synced, h, d);
+        if d > 1 {
+            eprintln!("[DBG] BlockCache::sync_all GKL DECR depth:{}→{}", d, d-1);
+            GKL.depth.store(d - 1, Ordering::Relaxed);
+        } else {
+            eprintln!("[DBG] BlockCache::sync_all GKL RELEASE");
+            GKL.holder.store(0, Ordering::Relaxed);
+            GKL.depth.store(0, Ordering::Relaxed);
+            GKL.flag.store(false, Ordering::Release);
+        }
     }
 
     pub fn invalidate(&self, k: usize) {
@@ -5176,10 +5220,27 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
-        eprintln!("[DBG] Kernel::tick id={} nchains={}", id, self.cache.chains.len());
-        // BUGFIX: 改为调用GKL.enter/GKL.leave，不再内联操作GKL字段。
-        // 原来的内联代码在释放时无条件depth=0，破坏了可重入锁的深度计数。
-        GKL.enter(id);
+        let gkl_h = GKL.holder.load(Ordering::Relaxed);
+        let gkl_d = GKL.depth.load(Ordering::Relaxed);
+        let gkl_f = GKL.flag.load(Ordering::Relaxed);
+        eprintln!("[DBG] Kernel::tick id={} GKL(holder={} depth={} flag={}) nchains={}", id, gkl_h, gkl_d, gkl_f, self.cache.chains.len());
+        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
+            eprintln!("[DBG] Kernel::tick GKL reentrant id={} depth:{}→{}", id, gkl_d, gkl_d+1);
+            GKL.depth.fetch_add(1, Ordering::Relaxed);
+        } else {
+            eprintln!("[DBG] Kernel::tick acquiring GKL...");
+            let mut gkl_spin: u64 = 0;
+            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                gkl_spin += 1;
+                if gkl_spin % 10_000_000 == 1 {
+                    eprintln!("[DBG] Kernel::tick SPINNING for GKL cnt={} holder={}", gkl_spin, GKL.holder.load(Ordering::Relaxed));
+                }
+                core::hint::spin_loop();
+            }
+            eprintln!("[DBG] Kernel::tick GKL acquired, holder→{} depth→1", id);
+            GKL.holder.store(id, Ordering::Relaxed);
+            GKL.depth.store(1, Ordering::Relaxed);
+        }
         let _ir = {
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
@@ -5209,8 +5270,18 @@ impl Kernel {
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
-        eprintln!("[DBG] Kernel::tick done");
-        GKL.leave(); // BUGFIX: 统一使用GKL.leave()，正确处理可重入深度
+        let d = GKL.depth.load(Ordering::Relaxed);
+        let h = GKL.holder.load(Ordering::Relaxed);
+        eprintln!("[DBG] Kernel::tick done GKL(holder={} depth={})", h, d);
+        if d > 1 {
+            eprintln!("[DBG] Kernel::tick GKL DECR depth:{}→{}", d, d-1);
+            GKL.depth.store(d - 1, Ordering::Relaxed);
+        } else {
+            eprintln!("[DBG] Kernel::tick GKL RELEASE");
+            GKL.holder.store(0, Ordering::Relaxed);
+            GKL.depth.store(0, Ordering::Relaxed);
+            GKL.flag.store(false, Ordering::Release);
+        }
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         eprintln!("[DBG] Kernel::cur_task");
