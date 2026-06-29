@@ -12,7 +12,7 @@ fn basic_bkl_single_acquire_release() {
     GKL.enter(1001);
     assert!(GKL.held());
     assert_eq!(GKL.owner(), 1001);
-    GKL.leave();
+    GKL.leave(1001);
     assert!(!GKL.held());
 }
 
@@ -21,10 +21,10 @@ fn basic_bkl_double_acquire_single_release() {
     GKL.enter(1002);
     GKL.enter(1002);
     assert_eq!(GKL.level(), 2);
-    GKL.leave();
+    GKL.leave(1002);
     assert!(GKL.held());
     assert_eq!(GKL.level(), 1);
-    GKL.leave();
+    GKL.leave(1002);
 }
 
 #[test]
@@ -34,10 +34,10 @@ fn basic_cross_module_lock_order() {
     let done = run_with_timeout(move || {
         GKL.enter(1003);
         p.get(1004);
-        GKL.leave();
+        GKL.leave(1003);
     }, 2000);
     if !done {
-        GKL.leave();
+        GKL.leave(1003);
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(done);

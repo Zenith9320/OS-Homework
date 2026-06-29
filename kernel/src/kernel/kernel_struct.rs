@@ -1,3 +1,9 @@
+//! 内核结构体模块 —— 定义内核核心结构体 `Kernel` 及其所有系统调用处理方法。
+//!
+//! `Kernel` 是操作系统的核心数据结构和控制中心，汇集了任务表、块缓存、帧池、
+//! CPU 调度、挂载表、信号量/共享内存存储、TTY 缓冲区和磁盘驱动等所有子系统。
+//! 同时包含 `dispatch_syscall` 方法，处理全部系统调用的分发与执行。
+
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::{BTreeMap, VecDeque};
@@ -24,18 +30,32 @@ use super::CLK;
 use super::dtk;
 use super::ProcInit;
 
+/// 内核核心结构体，汇集所有子系统。
+///
+/// 包含任务管理、内存管理（帧池）、块缓存、文件系统挂载、IPC 存储、
+/// CPU 调度信息、TTY 缓冲区和磁盘驱动。是系统调用分发和内核运行的中心。
 pub struct Kernel {
+    /// 全局任务表，管理所有进程和线程。
     pub tasks: TaskTable,
+    /// 块缓存，用于缓存磁盘块的读写。
     pub cache: BlockCache,
+    /// 物理内存帧池，管理空闲物理页面的分配和回收。
     pub pool: FramePool,
+    /// CPU 槽位数组，每个槽位记录当前在该 CPU 上运行的任务。
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
+    /// 文件系统挂载表。
     pub mnt: MountTable,
+    /// 信号量存储表，键为 key，值为弱引用的信号量数组。
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
+    /// 共享内存存储表，键为 key，值为弱引用的共享内存页面列表。
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
+    /// TTY 输入缓冲区，以双端队列存储 TTY 字符。
     pub tty_buf: Mutex<VecDeque<u8>>,
+    /// 磁盘设备驱动。
     pub disk: Disk,
 }
 impl Kernel {
+    /// 创建内核实例，指定物理帧总数 `nf`。
     pub fn new(nf: usize) -> Self {
         eprintln!("[DBG] Kernel::new");
         Self {
@@ -50,28 +70,13 @@ impl Kernel {
             disk: Disk::new("main"),
         }
     }
+    /// 内核滴答（tick）处理函数，在每个定时器中断时调用。
+    ///
+    /// 负责获取/释放全局内核锁（GKL），更新 CPU 空闲率统计，
+    /// 遍历所有缓存链并清理修改标记。
     pub fn tick(&self, id: usize) {
-        let gkl_h = GKL.holder.load(Ordering::Relaxed);
-        let gkl_d = GKL.depth.load(Ordering::Relaxed);
-        let gkl_f = GKL.flag.load(Ordering::Relaxed);
-        eprintln!("[DBG] Kernel::tick id={} GKL(holder={} depth={} flag={}) nchains={}", id, gkl_h, gkl_d, gkl_f, self.cache.chains.len());
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            eprintln!("[DBG] Kernel::tick GKL reentrant id={} depth:{}→{}", id, gkl_d, gkl_d+1);
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            eprintln!("[DBG] Kernel::tick acquiring GKL...");
-            let mut gkl_spin: u64 = 0;
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                gkl_spin += 1;
-                if gkl_spin % 10_000_000 == 1 {
-                    eprintln!("[DBG] Kernel::tick SPINNING for GKL cnt={} holder={}", gkl_spin, GKL.holder.load(Ordering::Relaxed));
-                }
-                core::hint::spin_loop();
-            }
-            eprintln!("[DBG] Kernel::tick GKL acquired, holder→{} depth→1", id);
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        eprintln!("[DBG] Kernel::tick id={} nchains={}", id, self.cache.chains.len());
+        GKL.enter(id);
         let _ir = {
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
@@ -101,19 +106,10 @@ impl Kernel {
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
-        let d = GKL.depth.load(Ordering::Relaxed);
-        let h = GKL.holder.load(Ordering::Relaxed);
-        eprintln!("[DBG] Kernel::tick done GKL(holder={} depth={})", h, d);
-        if d > 1 {
-            eprintln!("[DBG] Kernel::tick GKL DECR depth:{}→{}", d, d-1);
-            GKL.depth.store(d - 1, Ordering::Relaxed);
-        } else {
-            eprintln!("[DBG] Kernel::tick GKL RELEASE");
-            GKL.holder.store(0, Ordering::Relaxed);
-            GKL.depth.store(0, Ordering::Relaxed);
-            GKL.flag.store(false, Ordering::Release);
-        }
+        eprintln!("[DBG] Kernel::tick done id={}", id);
+        GKL.leave(id);
     }
+    /// 获取指定 CPU 上当前正在运行的任务。
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         eprintln!("[DBG] Kernel::cur_task");
         let cg = self.cpus.lock().unwrap();
@@ -127,6 +123,7 @@ impl Kernel {
             None => None,
         }
     }
+    /// 设置指定 CPU 上当前运行的任务。
     pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
         eprintln!("[DBG] Kernel::set_cur");
         let mut cg = self.cpus.lock().unwrap();
@@ -135,6 +132,9 @@ impl Kernel {
             cg[cpu] = t;
         }
     }
+    /// 处理缺页异常（page fault）。
+    ///
+    /// 根据缺页地址和当前运行任务判断是否为合法访问，返回处理是否成功。
     pub fn handle_pgfault(&self, addr: usize) -> bool {
         eprintln!("[DBG] Kernel::handle_pgfault");
         let _page = addr & !(PAGE_SZ - 1);
@@ -148,6 +148,9 @@ impl Kernel {
             None => false,
         }
     }
+    /// 扩展的缺页异常处理，支持访问类型参数。
+    ///
+    /// `_access` bit 1 表示写访问，bit 0 表示读访问。
     pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool {
         eprintln!("[DBG] Kernel::handle_pgfault_ext");
         let pga = addr >> 12;
@@ -155,6 +158,9 @@ impl Kernel {
         if _access & 0x2 != 0 { return self.handle_pgfault(addr); }
         self.handle_pgfault(addr)
     }
+    /// 初始化第一个用户态进程（init 进程）。
+    ///
+    /// 创建 root 任务并分配内核栈。
     pub fn proc_init(&self) {
         eprintln!("[DBG] Kernel::proc_init");
         let root = self.tasks.spawn_root();
@@ -163,25 +169,32 @@ impl Kernel {
         let _kstk = KStk::new();
         *root.kstk.lock().unwrap() = Some(_kstk);
     }
+    /// 向 TTY 输入缓冲区压入一个字符。
+    ///
+    /// 自动将回车符 `\r` 转换为换行符 `\n`，缓冲区最大 4096 字节。
     pub fn tty_push(&self, c: u8) {
         eprintln!("[DBG] Kernel::tty_push");
         let byte = if c == b'\r' { b'\n' } else { c };
         let mut buf = self.tty_buf.lock().unwrap();
         if buf.len() < 4096 { buf.push_back(byte); }
     }
+    /// 从 TTY 输入缓冲区弹出一个字符。
     pub fn tty_pop(&self) -> Option<u8> {
         eprintln!("[DBG] Kernel::tty_pop");
         let mut buf = self.tty_buf.lock().unwrap();
         buf.pop_front()
     }
+    /// 获取或创建指定 key 的信号量数组。
     pub fn get_sem(&self, key: u32, nsems: usize, flags: usize) -> Result<Arc<SemArr>, &'static str> {
         eprintln!("[DBG] Kernel::get_sem");
         SemArr::get_or_create(key, nsems, flags, &self.sem_store)
     }
+    /// 获取或创建指定 key 的共享内存区域。
     pub fn get_shm(&self, key: usize, npages: usize) -> Arc<Mutex<Vec<usize>>> {
         eprintln!("[DBG] Kernel::get_shm");
         shm_get_or_create(key, npages, &self.shm_store)
     }
+    /// 为任务创建一个操作系统线程，在其中循环执行用户态代码，直到任务完成。
     pub fn spawn_thread(&self, task: Arc<Task>) -> thread::JoinHandle<()> {
         eprintln!("[DBG] Kernel::spawn_thread");
         let token = task.vm_token.load(Ordering::Relaxed);
@@ -195,6 +208,10 @@ impl Kernel {
         })
     }
 
+    /// 系统调用分发器 —— 根据系统调用号 `nr` 分发到对应的处理逻辑。
+    ///
+    /// 参数 `a0`..`a5` 为系统调用的 6 个参数（按 System V ABI 约定）。
+    /// 返回操作结果（成功时返回 `Ok(result)`，失败时返回 `Err(错误码)`）。
     pub fn dispatch_syscall(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> {
         eprintln!("[DBG] Kernel::dispatch_syscall");
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
@@ -206,6 +223,8 @@ impl Kernel {
             }).unwrap_or(0)
         };
         match nr {
+            // SYS_READ: 从文件描述符 `fd` 读取数据到用户缓冲区。
+            // 检查缓冲区访问权限，通过块缓存进行优化读取。
             SYS_READ => {
                 let fd = a0;
                 let buf_addr = a1;
@@ -237,6 +256,8 @@ impl Kernel {
                     Ok(count)
                 }
             }
+            // SYS_WRITE: 将用户缓冲区数据写入文件描述符 `fd`。
+            // 检查缓冲区访问权限，支持块缓存写优化和磁盘操作计数。
             SYS_WRITE => {
                 let fd = a0;
                 let buf_addr = a1;
@@ -268,6 +289,10 @@ impl Kernel {
                 }
                 Ok(actual_len)
             }
+            // SYS_OPEN: 打开或创建文件。
+            //
+            // 解析路径，检查权限标志（O_CREAT、O_EXCL、O_TRUNC 等），
+            // 分配新的文件描述符并返回。
             SYS_OPEN => {
                 let path_addr = a0;
                 let flags = a1;
@@ -335,6 +360,9 @@ impl Kernel {
                 };
                 Ok(fd)
             }
+            // SYS_CLOSE: 关闭文件描述符。
+            //
+            // 从块缓存中移除对应条目，并更新磁盘操作计数。
             SYS_CLOSE => {
                 let fd = a0;
                 if fd > N_PROC * 4 { return Err("ebadf"); }
@@ -356,6 +384,9 @@ impl Kernel {
                 }
                 Ok(0)
             }
+            // SYS_STAT / SYS_FSTAT: 获取文件状态信息。
+            //
+            // 验证状态缓冲区访问权限，返回文件设备号或 fd 相关信息。
             SYS_STAT | SYS_FSTAT => {
                 let stat_buf = a1;
                 if stat_buf == 0 { return Err("efault"); }
@@ -372,6 +403,10 @@ impl Kernel {
                 };
                 Ok(0)
             }
+            // SYS_MMAP: 内存映射系统调用。
+            //
+            // 验证长度、对齐、保护标志和映射标志，检查可用物理内存，
+            // 计算映射地址并返回。
             SYS_MMAP => {
                 let addr = a0;
                 let len = a1;
@@ -406,6 +441,9 @@ impl Kernel {
                 }
                 Ok(result_addr)
             }
+            // SYS_MUNMAP: 取消内存映射。
+            //
+            // 验证地址对齐，按页遍历并释放映射区域。
             SYS_MUNMAP => {
                 let addr = a0;
                 let len = a1;
@@ -417,6 +455,9 @@ impl Kernel {
                 }
                 Ok(0)
             }
+            // SYS_BRK: 调整进程的数据段边界（program break）。
+            //
+            // 扩展或收缩堆空间，根据需要分配或释放物理页面。
             SYS_BRK => {
                 let new_brk = a0;
                 if new_brk == 0 { return Ok(0x0040_0000); }
@@ -444,6 +485,10 @@ impl Kernel {
                 }
                 Ok(aligned)
             }
+            // SYS_IOCTL: 设备输入输出控制。
+            //
+            // 支持终端控制（TCGETS, TCSETS）、进程组控制（TIOCGPGRP, TIOCSPGRP）、
+            // 窗口大小获取（TIOCGWINSZ）以及文件描述符控制（FIONCLEX, FIOCLEX, FIONBIO）。
             SYS_IOCTL => {
                 let fd = a0;
                 let cmd = a1;
@@ -478,6 +523,9 @@ impl Kernel {
                     _ => Err("enotty"),
                 }
             }
+            // SYS_PIPE: 创建匿名管道。
+            //
+            // 创建一对读写 pipe 端点，为调用任务分配两个文件描述符。
             SYS_PIPE => {
                 let fds_addr = a0;
                 let pipe_flags = a1;
@@ -497,6 +545,9 @@ impl Kernel {
                     Err("esrch")
                 }
             }
+            // SYS_DUP: 复制文件描述符。
+            //
+            // 复制 `old_fd` 指向的文件对象，分配一个新的最小可用 fd 编号。
             SYS_DUP => {
                 let old_fd = a0;
                 if old_fd >= N_PROC * 4 { return Err("ebadf"); }
@@ -513,6 +564,9 @@ impl Kernel {
                     Err("esrch")
                 }
             }
+            // SYS_DUP2: 将文件描述符复制到指定的 `new_fd`。
+            //
+            // 如果 `new_fd` 已经打开则先关闭，然后将 `old_fd` 复制过去。
             SYS_DUP2 => {
                 let old_fd = a0;
                 let new_fd = a1;
@@ -532,6 +586,9 @@ impl Kernel {
                 }
                 Ok(new_fd)
             }
+            // SYS_FORK: 创建子进程。
+            //
+            // 检查内存压力，分配新的进程 ID，确保有足够的可用内存后返回子进程 PID。
             SYS_FORK => {
                 let parent_token = _caller_token;
                 let _child_copy_cost = {
@@ -555,6 +612,9 @@ impl Kernel {
                 }
                 Ok(new_pid)
             }
+            // SYS_EXEC: 执行新程序。
+            //
+            // 验证路径、参数和环境变量的可访问性，校验 ELF 头部。
             SYS_EXEC => {
                 let path_addr = a0;
                 let argv_addr = a1;
@@ -576,6 +636,10 @@ impl Kernel {
                 ]);
                 Ok(0)
             }
+            // SYS_EXIT: 退出当前进程。
+            //
+            // 调用任务的退出流程，向父进程发送 SIGCHLD 信号，
+            // 并将当前进程的所有子进程转移给 init 进程收养。
             SYS_EXIT => {
                 let status = a0;
                 let _normalized = (status & 0xFF) << 8;
@@ -598,6 +662,14 @@ impl Kernel {
                 }
                 Ok(0)
             }
+            // SYS_WAIT4: 等待子进程状态改变。
+            //
+            // 支持 `WNOHANG`（非阻塞）、`WUNTRACED`、`WCONTINUED` 等选项。
+            // `pid` 参数含义：
+            // - -1: 等待任意子进程
+            // - 0: 等待同一进程组的子进程
+            // - >0: 等待指定 PID 的子进程
+            // - < -1: 等待进程组 ID 为 -pid 的任意子进程
             SYS_WAIT4 => {
                 let pid = a0 as isize;
                 let status_addr = a1;
@@ -684,6 +756,14 @@ impl Kernel {
                     }
                 }
             }
+            // SYS_KILL: 向进程发送信号。
+            //
+            // 检查信号合法性，对 SIGKILL/SIGSTOP 防止向 init 进程发送。
+            // `pid` 含义：
+            // - 0: 发送给同一进程组的所有进程
+            // - -1: 发送给所有进程（除 init 外）
+            // - >0: 发送给指定进程
+            // - < -1: 发送给进程组 ID 为 -pid 的所有进程
             SYS_KILL => {
                 let pid = a0 as isize;
                 let sig = a1;
@@ -732,6 +812,10 @@ impl Kernel {
                     }
                 }
             }
+            // SYS_FCNTL: 文件控制操作。
+            //
+            // 支持的命令：F_DUPFD、F_DUPFD_CLOEXEC、F_GETFD、F_SETFD、
+            // F_GETFL、F_SETFL、F_GETLK、F_SETLK、F_SETLKW。
             SYS_FCNTL => {
                 let fd = a0;
                 let cmd = a1;
@@ -789,6 +873,7 @@ impl Kernel {
                     _ => Err("einval"),
                 }
             }
+            // SYS_GETPID: 获取当前进程的 PID。
             SYS_GETPID => {
                 let cur = self.cur_task(0);
                 match cur {
@@ -796,6 +881,7 @@ impl Kernel {
                     None => Ok(1),
                 }
             }
+            // SYS_GETPPID: 获取当前进程的父进程 PID。
             SYS_GETPPID => {
                 let cur = self.cur_task(0);
                 match cur {
@@ -809,6 +895,10 @@ impl Kernel {
                     None => Ok(0),
                 }
             }
+            // SYS_SETPGID: 设置进程的进程组 ID。
+            //
+            // 只能为自身或子进程设置 PGID。如果 `pid == 0` 则使用调用者 PID，
+            // 如果 `pgid == 0` 则使用目标进程的 PID。
             SYS_SETPGID => {
                 let pid = a0;
                 let pgid = a1;
@@ -833,6 +923,9 @@ impl Kernel {
                 }
                 Ok(0)
             }
+            // SYS_GETPGID: 获取进程的进程组 ID。
+            //
+            // 如果 `pid == 0` 则返回调用者的 PGID。
             SYS_GETPGID => {
                 let pid = a0;
                 let cur = self.cur_task(0);
@@ -847,6 +940,10 @@ impl Kernel {
                     None => Err("esrch"),
                 }
             }
+            // SYS_SETSID: 创建新会话并设置进程组 ID。
+            //
+            // 如果调用者已是进程组 leader 则返回错误（EPERM），
+            // 否则将 PGID 设置为当前 PID 并返回会话 ID。
             SYS_SETSID => {
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
@@ -861,6 +958,9 @@ impl Kernel {
                     Err("esrch")
                 }
             }
+            // SYS_EPOLL_CREATE: 创建 epoll 实例。
+            //
+            // 根据 size 计算 epoll fd 编号和所需的后备内存大小。
             SYS_EPOLL_CREATE => {
                 let size = a0;
                 if size == 0 { return Err("einval"); }
@@ -869,6 +969,9 @@ impl Kernel {
                 if _backing.is_none() { return Err("enomem"); }
                 Ok(epfd)
             }
+            // SYS_EPOLL_CTL: 控制 epoll 实例（添加/修改/删除文件描述符）。
+            //
+            // op: 1=EPOLL_CTL_ADD, 2=EPOLL_CTL_DEL, 3=EPOLL_CTL_MOD。
             SYS_EPOLL_CTL => {
                 let epfd = a0;
                 let op = a1 as i32;
@@ -884,6 +987,10 @@ impl Kernel {
                     _ => Err("einval"),
                 }
             }
+            // SYS_EPOLL_WAIT: 等待 epoll 事件。
+            //
+            // 验证事件缓冲区访问权限，支持超时（timeout > 0 表示毫秒级超时，
+            // timeout == 0 立即返回，timeout < 0 无限等待）。
             SYS_EPOLL_WAIT => {
                 let epfd = a0;
                 let events_addr = a1;
@@ -903,6 +1010,12 @@ impl Kernel {
                 }
                 Ok(0)
             }
+            // SYS_CLOCK_GETTIME: 获取时钟时间。
+            //
+            // 支持三种时钟类型：
+            // - 0: CLOCK_REALTIME（实时时钟）
+            // - 1: CLOCK_MONOTONIC（单调时钟）
+            // - 4: CLOCK_MONOTONIC_RAW（原始单调时钟）
             SYS_CLOCK_GETTIME => {
                 let clk_id = a0;
                 let tp_addr = a1;
@@ -929,6 +1042,10 @@ impl Kernel {
                     _ => Err("einval"),
                 }
             }
+            // SYS_SIGACTION: 设置信号处理动作。
+            //
+            // 不允许为 SIGKILL 和 SIGSTOP 设置处理函数。
+            // 验证 `act` 和 `oldact` 缓冲区的访问权限。
             SYS_SIGACTION => {
                 let signo = a0;
                 let act_addr = a1;
@@ -941,6 +1058,10 @@ impl Kernel {
                 let _sa_mask = if act_addr != 0 { a4 } else { 0 };
                 Ok(0)
             }
+            // SYS_SIGPROCMASK: 检查和更改阻塞信号集。
+            //
+            // how: 0=SIG_BLOCK（添加阻塞）, 1=SIG_UNBLOCK（解除阻塞）, 2=SIG_SETMASK（设置掩码）。
+            // SIGKILL 和 SIGSTOP 不可被阻塞（unmaskable）。
             SYS_SIGPROCMASK => {
                 let how = a0;
                 let set_addr = a1;
@@ -967,6 +1088,10 @@ impl Kernel {
                 }
                 Ok(0)
             }
+            // SYS_FUTEX: 快速用户态互斥锁（futex）操作。
+            //
+            // 支持的 futex_op：0=FUTEX_WAIT, 1=FUTEX_WAKE, 3=FUTEX_REQUEUE,
+            // 5=FUTEX_WAIT_BITSET, 9=FUTEX_WAKE_OP。
             SYS_FUTEX => {
                 let uaddr = a0;
                 let op = a1;
@@ -1011,6 +1136,10 @@ impl Kernel {
         }
     }
 
+    /// 调度器滴答函数：在每次定时器中断时更新时钟并检查是否需要重新调度。
+    ///
+    /// 计算当前任务剩余时间片，如果时间片耗尽则标记需要重调度，
+    /// 寻找可运行的替代任务。
     pub fn schedule_tick(&self, cpu: usize) {
         eprintln!("[DBG] Kernel::schedule_tick");
         dtk(cpu);
@@ -1039,6 +1168,7 @@ impl Kernel {
         }
     }
 
+    /// CPU 负载均衡：统计各 CPU 负载情况，计算不均匀程度，返回均衡结果。
     pub fn balance_load(&self) -> usize {
         eprintln!("[DBG] Kernel::balance_load");
         let cpus = self.cpus.lock().unwrap();
@@ -1064,6 +1194,9 @@ impl Kernel {
         compute_load_balance(&counts, &prios, &blocked)
     }
 
+    /// 回收僵尸进程：获取所有僵尸任务，统计可回收页面数量并收割它们。
+    ///
+    /// 返回回收的僵尸进程数量。
     pub fn reclaim_zombies(&self) -> usize {
         eprintln!("[DBG] Kernel::reclaim_zombies");
         let zombies = self.tasks.zombie_tasks();
@@ -1081,6 +1214,7 @@ impl Kernel {
         count
     }
 
+    /// 路径查找：规范化并解析指定路径，通过挂载表解析后返回实际路径。
     pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> {
         eprintln!("[DBG] Kernel::lookup_path");
         if path.is_empty() { return Err("enoent"); }
@@ -1102,6 +1236,9 @@ impl Kernel {
         Ok(resolved)
     }
 
+    /// 分配物理页面：从帧池中分配最多 `count` 个连续页面。
+    ///
+    /// 如果空闲页面不足，先尝试碎片整理。返回分配到的物理地址列表。
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
         eprintln!("[DBG] Kernel::alloc_pages");
         let mut pages = Vec::with_capacity(count);
@@ -1132,6 +1269,7 @@ impl Kernel {
         pages
     }
 
+    /// 释放物理页面：将指定的物理地址对应的帧标记为空闲。
     pub fn free_pages(&self, pages: &[usize]) {
         eprintln!("[DBG] Kernel::free_pages");
         for &pa in pages {
@@ -1144,6 +1282,9 @@ impl Kernel {
         }
     }
 
+    /// 计算当前内存压力百分比（0-100）。
+    ///
+    /// 返回已使用页面占总页面的百分比，同时统计空闲区域的碎片块数。
     pub fn memory_pressure(&self) -> usize {
         eprintln!("[DBG] Kernel::memory_pressure");
         let total = self.pool.cap;
@@ -1164,11 +1305,15 @@ impl Kernel {
         pressure
     }
 
+    /// 返回块缓存的统计信息：(总条目数, 脏条目数)。
     pub fn cache_stats(&self) -> (usize, usize) {
         eprintln!("[DBG] Kernel::cache_stats");
         (self.cache.total_entries(), self.cache.dirty_count())
     }
 
+    /// 执行 fork 操作：创建父进程的子进程副本。
+    ///
+    /// 复制文件描述符表、继承虚拟内存令牌，估计所需的页面成本。
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
         eprintln!("[DBG] Kernel::do_fork");
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
@@ -1192,6 +1337,10 @@ impl Kernel {
         Ok(child_id)
     }
 
+    /// 执行 exec 操作：替换进程的执行映像。
+    ///
+    /// 设置可执行路径，校验 ELF 头部，关闭带 CLOEXEC 标志的文件描述符，
+    /// 设置新的用户态栈和入口点。
     pub fn do_exec(&self, task_id: usize, path: &str, args: Vec<String>, envs: Vec<String>) -> Result<(), &'static str> {
         eprintln!("[DBG] Kernel::do_exec");
         let task = self.tasks.find(task_id).ok_or("esrch")?;
@@ -1231,6 +1380,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// 创建管道：为指定任务创建一对 pipe 端点，返回 (读端 fd, 写端 fd)。
     pub fn do_pipe(&self, task_id: usize) -> Result<(usize, usize), &'static str> {
         eprintln!("[DBG] Kernel::do_pipe");
         let task = self.tasks.find(task_id).ok_or("esrch")?;
@@ -1240,6 +1390,10 @@ impl Kernel {
         Ok((rd_fd, wr_fd))
     }
 
+    /// 执行 wait 操作：等待子进程状态改变。
+    ///
+    /// 支持根据 `target_pid`（-1 任意，0 同进程组，>0 指定 PID，<0 指定 PGID）
+    /// 和 `options`（WNOHANG）过滤。找到僵尸子进程后返回其 ID 和退出码。
     pub fn do_wait(&self, parent_id: usize, target_pid: isize, options: usize) -> Result<(usize, usize), &'static str> {
         eprintln!("[DBG] Kernel::do_wait");
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;

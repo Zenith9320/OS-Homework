@@ -1,13 +1,35 @@
+//! 挂载表模块，提供路径挂载与解析功能。
+//!
+//! 该模块实现了挂载表 (`MountTable`)，用于将路径前缀 (`prefix`) 映射到目标设备 (`target`)。
+//! 支持挂载绑定、前缀匹配解析、卸载及挂载列表查询等操作。
+//! 挂载表内部使用读写锁 (`RwLock`) 保护并发访问。
+
 use std::sync::RwLock;
 
+/// 挂载条目，表示一个路径前缀到目标设备的映射。
 #[derive(Clone, Debug)]
-pub struct MountEntry { pub prefix: String, pub target: String }
+pub struct MountEntry {
+    /// 路径前缀，用于匹配挂载点。
+    pub prefix: String,
+    /// 目标设备路径，挂载的目标位置。
+    pub target: String,
+}
 
-pub struct MountTable { pub entries: RwLock<Vec<MountEntry>> }
+/// 挂载表，存储所有挂载条目并提供挂载解析操作。
+pub struct MountTable {
+    /// 挂载条目列表，由读写锁保护，支持并发读取与互斥写入。
+    pub entries: RwLock<Vec<MountEntry>>,
+}
 impl MountTable {
+    /// 创建一个新的空挂载表。
     pub fn new() -> Self {
         eprintln!("[DBG] MountTable::new");
         Self { entries: RwLock::new(Vec::new()) } }
+
+    /// 绑定一个挂载点，将前缀 `pfx` 映射到目标 `tgt`。
+    ///
+    /// 如果相同的 (prefix, target) 对已存在，则不会重复添加。
+    /// 新条目会按前缀长度降序排列，确保最长前缀优先匹配。
     pub fn bind(&self, pfx: &str, tgt: &str) {
         eprintln!("[DBG] MountTable::bind");
         let mut e = self.entries.write().unwrap();
@@ -22,6 +44,12 @@ impl MountTable {
             e.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
         }
     }
+
+    /// 解析给定路径，将其转换为包含目标设备的完整路径。
+    ///
+    /// 该函数使用最长前缀匹配策略查找挂载条目：
+    /// - 如果匹配到挂载前缀，则将前缀替换为目标设备路径，用 `:` 分隔，并递归解析剩余路径。
+    /// - 如果没有匹配，则对路径进行规范化（压缩连续的 `/`），返回规范化后的路径。
     pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
         eprintln!("[DBG] MountTable::resolve");
         let tbl = self.entries.read().unwrap();
@@ -74,6 +102,10 @@ impl MountTable {
         }
     }
 
+    /// 卸载指定前缀的所有挂载条目。
+    ///
+    /// 遍历挂载表，移除所有 `prefix` 等于 `pfx` 的条目。
+    /// 返回 `true` 表示至少有一个条目被移除。
     pub fn unmount(&self, pfx: &str) -> bool {
         eprintln!("[DBG] MountTable::unmount");
         let mut e = self.entries.write().unwrap();
@@ -89,6 +121,7 @@ impl MountTable {
         e.len() < before
     }
 
+    /// 列出所有挂载条目，返回 `(前缀, 目标)` 对的列表。
     pub fn list_mounts(&self) -> Vec<(String, String)> {
         eprintln!("[DBG] MountTable::list_mounts");
         let tbl = self.entries.read().unwrap();
@@ -99,6 +132,11 @@ impl MountTable {
         result
     }
 
+    /// 查找与给定路径最匹配的挂载条目。
+    ///
+    /// 使用最长前缀匹配策略：遍历所有非空前缀的挂载条目，
+    /// 找到与 `path` 前缀匹配且前缀长度最长的条目。
+    /// 返回找到的 `MountEntry` 的克隆，如果没有匹配则返回 `None`。
     pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
         eprintln!("[DBG] MountTable::find_mount");
         let tbl = self.entries.read().unwrap();
@@ -122,11 +160,13 @@ impl MountTable {
         best.map(|m| MountEntry { prefix: m.prefix.clone(), target: m.target.clone() })
     }
 
+    /// 返回当前挂载表中的条目数量。
     pub fn mount_count(&self) -> usize {
         eprintln!("[DBG] MountTable::mount_count");
         self.entries.read().unwrap().len()
     }
 
+    /// 检查挂载表中是否存在指定前缀的条目。
     pub fn has_prefix(&self, pfx: &str) -> bool {
         eprintln!("[DBG] MountTable::has_prefix");
         self.entries.read().unwrap().iter().any(|m| {

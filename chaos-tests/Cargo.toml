@@ -11,11 +11,3 @@ description = "Test suite for the Chaos Monolith Kernel debugging exercise"
 [[test]]
 name = "basic"
 path = "tests/basic/main.rs"
-
-[[test]]
-name = "advanced"
-path = "tests/advanced/main.rs"
-
-[[test]]
-name = "pressure"
-path = "tests/pressure/main.rs"

@@ -1,3 +1,5 @@
+//! 内核模块根文件 —— 包含所有子模块声明、全局时钟变量、初始化结构体以及扁平的重新导出。
+
 #![allow(unused, dead_code, non_upper_case_globals, non_camel_case_types, unused_assignments, unused_mut)]
 #![feature(renamed_spin_loop, deque_make_contiguous)]
 
@@ -5,42 +7,60 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-// ── Clock globals ──
+// ── 全局时钟 ──
+
+/// 当前 CPU 的时钟滴答计数器，每次定时器中断递增。
 pub static CLK: AtomicUsize = AtomicUsize::new(0);
+/// 所有 CPU 共享的全局时钟滴答计数器。
 pub static CLK_ALL: AtomicUsize = AtomicUsize::new(0);
 
+/// 读取当前 CPU 的时钟值（滴答数）。
 pub fn wclk() -> usize {
     eprintln!("[DBG] wclk");
     CLK.load(Ordering::Relaxed) }
+/// 读取全局时钟值（滴答数）。
 pub fn cclk() -> usize {
     eprintln!("[DBG] cclk");
     CLK_ALL.load(Ordering::Relaxed) }
+/// 增加时钟滴答计数。cpu_id == 0 时同时递增 CPU 时钟和全局时钟，否则只递增全局时钟。
 pub fn dtk(cpu_id: usize) {
     eprintln!("[DBG] dtk");
     if cpu_id == 0 { CLK.fetch_add(1, Ordering::Relaxed); }
     CLK_ALL.fetch_add(1, Ordering::Relaxed);
 }
+/// 根据当前时钟滴答数计算以毫秒为单位的上线时间。
 pub fn up_ms() -> usize {
     eprintln!("[DBG] up_ms");
     wclk() * consts::USEC_TICK / 1000 }
+/// 定时器中断处理入口，调用 `dtk` 增加时间。
 pub fn tmr(cpu_id: usize) {
     eprintln!("[DBG] tmr");
     dtk(cpu_id); }
+/// 串行端口字符转换：将回车符 `\r` 转换为换行符 `\n`。
 pub fn ser(c: u8) -> u8 {
     eprintln!("[DBG] ser");
     if c == b'\r' { b'\n' } else { c } }
 
+/// 同步让出当前线程的执行权（调用 `thread::yield_now`）。
 pub fn yield_now_sync() {
     eprintln!("[DBG] yield_now_sync");
     thread::yield_now(); }
 
-// ── ProcInit ──
+// ── ProcInit：进程初始化参数 ──
+
+/// 进程初始化参数结构体，包含命令行参数、环境变量和辅助向量（auxv），
+/// 用于在创建新进程时设置用户态栈上的初始数据。
 pub struct ProcInit {
+    /// 命令行参数列表。
     pub args: Vec<String>,
+    /// 环境变量列表。
     pub envs: Vec<String>,
+    /// 辅助向量表，键为类型标识，值为相应的数据。
     pub auxv: BTreeMap<u8, usize>,
 }
 impl ProcInit {
+    /// 计算将参数、环境变量和辅助向量压入栈后的新栈指针位置。
+    /// 从栈顶 `top` 开始向下分配空间，返回对齐后的栈指针。
     pub fn push_at(&self, top: usize) -> usize {
         eprintln!("[DBG] ProcInit::push_at");
         let word = std::mem::size_of::<usize>();
@@ -74,6 +94,7 @@ impl ProcInit {
         sp
     }
 
+    /// 计算 ProcInit 数据在栈上占用的总字节数。
     pub fn total_size(&self) -> usize {
         eprintln!("[DBG] ProcInit::total_size");
         let mut sz = 0usize;
@@ -84,7 +105,7 @@ impl ProcInit {
     }
 }
 
-// ── Module declarations ──
+// ── 模块声明 ──
 pub mod consts;
 pub mod locking;
 pub mod sync_queue;
@@ -113,7 +134,7 @@ pub mod resource;
 pub mod utils;
 pub mod kernel_struct;
 
-// ── Flat re-exports (chaos_tests::*) ──
+// ── 扁平重新导出（方便上层模块通过 `kernel::*` 访问所有公开类型） ──
 pub use self::consts::*;
 pub use self::locking::*;
 pub use self::sync_queue::*;

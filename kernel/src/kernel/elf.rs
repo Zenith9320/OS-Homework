@@ -1,3 +1,20 @@
+//! ELF 可执行文件加载支持模块：提供 ELF 头部验证功能，
+//! 用于检查 ELF 文件的合法性（魔数、架构、字节序等）并提取入口地址。
+
+/// 验证 ELF 文件头部，检查其格式是否合法。
+///
+/// 检查项包括：
+/// - 最小长度（64 字节）
+/// - ELF 魔数（0x7f 'E' 'L' 'F'）
+/// - 64 位格式（EI_CLASS = 2）
+/// - 小端字节序（EI_DATA = 1）
+/// - ELF 版本号
+/// - 可执行文件类型（ET_EXEC 或 ET_DYN）
+/// - 程序头是否在文件范围内
+/// - 至少有一个 LOAD 类型的程序头
+///
+/// `data`：ELF 文件的原始字节切片。
+/// 返回 `Ok(entry)` 包含入口地址，或 `Err(描述)` 表示验证失败。
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
     eprintln!("[DBG] validate_elf_header");
     if data.len() < 64 { return Err("too_short"); }
