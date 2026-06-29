@@ -1,1 +1,1 @@
-../../kernel/src/kernel.rs
+../../kernel/src/kernel/mod.rs

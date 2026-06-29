@@ -30,3 +30,5 @@ modules/*/objs
 # Rust
 modules/*/target
 test/
+.gitignore
+add_debug.py
