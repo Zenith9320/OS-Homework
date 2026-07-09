@@ -61,6 +61,8 @@ impl FdState {
 pub struct FHandle {
     /// 文件路径（用于调试和标识）
     pub path: String,
+    /// 文件在 SimpleFS 中的 inode 编号（0 表示无关联）
+    pub ino: usize,
     /// 文件数据缓冲区的共享引用（Arc<Mutex<Vec<u8>>>），允许多个句柄共享同一份数据
     pub data: Arc<Mutex<Vec<u8>>>,
     /// 文件描述符状态的共享引用，记录偏移量、选项和锁信息
@@ -94,6 +96,7 @@ impl FHandle {
         eprintln!("[DBG] FHandle::new");
         Self {
             path: path.to_string(),
+            ino: 0,
             data: Arc::new(Mutex::new(Vec::new())),
             desc: FdState::create(opt),
             pipe,
@@ -110,6 +113,7 @@ impl FHandle {
         eprintln!("[DBG] FHandle::with_data");
         Self {
             path: path.to_string(),
+            ino: 0,
             data: Arc::new(Mutex::new(d)),
             desc: FdState::create(opt),
             pipe: false,
@@ -123,6 +127,7 @@ impl FHandle {
         eprintln!("[DBG] FHandle::dup");
         FHandle {
             path: self.path.clone(),
+            ino: self.ino,
             data: self.data.clone(),
             desc: self.desc.clone(),
             pipe: self.pipe,
@@ -589,6 +594,7 @@ impl FLike {
             FLike::File(f) => {
                 let cloned = FHandle {
                     path: f.path.clone(),
+                    ino: f.ino,
                     data: f.data.clone(),
                     desc: f.desc.clone(),
                     pipe: f.pipe,

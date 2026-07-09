@@ -13,6 +13,7 @@ use super::locking::{GKL, KernLock};
 use super::sync_queue::{EvBus, EvFlag, SyncQueue};
 use super::files::{FLike, FHandle, FdOpt, PipeNode, PipeDir, EpInst, EpEvent};
 use super::futex::FutexBucket;
+use super::address_space::AddrSpace;
 use super::ipc::SemCtx;
 use super::ipc::ShmCtx;
 use super::semaphore::Sema;
@@ -128,6 +129,8 @@ pub struct Task {
     pub thd_ctx: Mutex<Option<ThdCtx>>,
     /// 虚拟内存令牌，用于关联地址空间。
     pub vm_token: AtomicUsize,
+    /// 进程地址空间（虚拟内存映射 + COW 页面表）。
+    pub addr_space: Mutex<AddrSpace>,
 }
 
 impl Task {
@@ -156,6 +159,7 @@ impl Task {
             kstk: Mutex::new(None),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
             vm_token: AtomicUsize::new(0),
+            addr_space: Mutex::new(AddrSpace::new(0)),
         })
     }
     /// 返回任务的 ID。

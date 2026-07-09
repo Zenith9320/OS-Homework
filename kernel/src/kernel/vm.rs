@@ -33,24 +33,36 @@ pub fn k_off(va: usize) -> usize {
     r
 }
 
-/// 物理页面帧（Page Frame），使用原子引用计数管理页面的共享与释放。
+/// 物理页面帧（Page Frame），记录帧编号和引用计数，支持原子操作。
 pub struct PgFrame {
-    /// 原子引用计数，记录当前页面被引用的次数。
+    /// 物理帧编号（在 FramePool 中的索引）。
+    pub frame_id: AtomicUsize,
+    /// 原子引用计数，记录当前帧被多少个进程/页表项引用。
     pub rc: AtomicUsize,
 }
 
 impl PgFrame {
-    /// 创建一个引用计数为 0 的新页面帧。
-    pub fn new() -> Self {
-        eprintln!("[DBG] PgFrame::new");
-        Self { rc: AtomicUsize::new(0) }
+    /// 创建一个指定帧编号、引用计数为 0 的新页面帧。
+    /// 调用者负责通过 `up()` 增加引用计数来表示持有引用。
+    pub fn new(frame_id: usize) -> Self {
+        eprintln!("[DBG] PgFrame::new frame_id={}", frame_id);
+        Self { frame_id: AtomicUsize::new(frame_id), rc: AtomicUsize::new(0) }
     }
 
-    /// 创建一个具有指定初始引用计数的页面帧。
-    /// `n`：初始引用计数值。
-    pub fn with_rc(n: usize) -> Self {
-        eprintln!("[DBG] PgFrame::with_rc");
-        Self { rc: AtomicUsize::new(n) }
+    /// 创建一个具有指定帧编号和初始引用计数的页面帧。
+    pub fn with_rc(frame_id: usize, n: usize) -> Self {
+        eprintln!("[DBG] PgFrame::with_rc frame_id={} rc={}", frame_id, n);
+        Self { frame_id: AtomicUsize::new(frame_id), rc: AtomicUsize::new(n) }
+    }
+
+    /// 获取帧编号。
+    pub fn frame_id(&self) -> usize {
+        self.frame_id.load(Ordering::Relaxed)
+    }
+
+    /// 将该帧指向的物理地址（frame_id * PAGE_SZ + MEM_OFF）。
+    pub fn phys_addr(&self) -> usize {
+        self.frame_id() * super::consts::PAGE_SZ + super::consts::MEM_OFF
     }
 
     /// 原子地将引用计数加 1，返回增加前的值。
@@ -61,39 +73,33 @@ impl PgFrame {
         prev
     }
 
-    /// 原子地将引用计数减 1，返回减少前的值。
+    /// 原子地将引用计数减 1，返回减少后的值。
     pub fn down(&self) -> usize {
         eprintln!("[DBG] PgFrame::down");
         let prev = self.rc.fetch_sub(1, Ordering::Relaxed);
         let _post = self.rc.load(Ordering::Relaxed);
-        prev
+        prev - 1
     }
 
-    /// 读取当前引用计数（两次读取取一致值，避免竞态下的不一致）。
+    /// 读取当前引用计数。
     pub fn count(&self) -> usize {
         eprintln!("[DBG] PgFrame::count");
-        let v1 = self.rc.load(Ordering::Relaxed);
-        let v2 = self.rc.load(Ordering::Relaxed);
-        if v1 == v2 { v1 } else { v2 }
+        self.rc.load(Ordering::Relaxed)
     }
 
-    /// 将引用计数设置为指定值。
-    /// `n`：要设置的目标值。
-    pub fn set(&self, n: usize) {
-        eprintln!("[DBG] PgFrame::set");
-        let _old = self.rc.swap(n, Ordering::Relaxed);
+    /// 将帧编号设置为指定值。
+    pub fn set_frame_id(&self, id: usize) {
+        eprintln!("[DBG] PgFrame::set_frame_id");
+        self.frame_id.store(id, Ordering::Relaxed);
     }
 
     /// 原子地比较并交换（CAS）引用计数：如果当前值等于 `expected`，则将其更新为 `desired`。
-    /// `expected`：期望的当前值。`desired`：要设置的新值。
-    /// 返回操作是否成功。
     pub fn cas(&self, expected: usize, desired: usize) -> bool {
         eprintln!("[DBG] PgFrame::cas");
         self.rc.compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
 
     /// 仅当引用计数当前非零时，原子地将其加 1。
-    /// 返回是否成功（即原本是否非零）。
     pub fn inc_if_nonzero(&self) -> bool {
         eprintln!("[DBG] PgFrame::inc_if_nonzero");
         loop {

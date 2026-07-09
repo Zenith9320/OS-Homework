@@ -544,7 +544,7 @@ impl BlockCache {
     ///
     /// * `k` - 要获取的块键值
     /// * `lat` - 模拟的读取延迟
-    pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
+    pub fn fetch(&self, k: usize, lat: Duration, disk: &super::io::Disk) -> Option<Vec<u8>> {
         let tid = format!("{:?}", std::thread::current().id());
         let ci = {
             let raw = k;
@@ -585,16 +585,13 @@ impl BlockCache {
             return Some(data);
         }
         let tick_before = CLK.load(Ordering::Relaxed);
-        eprintln!("[DBG] BlockCache::fetch chain[{}] cache MISS, sleeping {:?} while holding lk tid={}", ci, lat, tid);
-        if lat.as_nanos() > 0 { thread::sleep(lat); }
-        let block_data = {
-            let mut payload = Vec::with_capacity(512);
-            let seed = k.wrapping_mul(0x9E3779B9) ^ tick_before;
-            for i in 0..512 {
-                payload.push(((seed.wrapping_add(i)) & 0xFF) as u8);
-            }
-            payload
-        };
+        eprintln!("[DBG] BlockCache::fetch chain[{}] cache MISS, reading from disk tid={}", ci, tid);
+        // 未命中：从磁盘读取
+        let mut block_data = vec![0u8; 512];
+        match disk.read_block(k, &mut block_data) {
+            Ok(()) => {}
+            Err(_) => { ch.lk.v.store(false, Ordering::Release); return None; }
+        }
         let result = block_data.clone();
         let slot = CacheSlot {
             id: k,
@@ -610,6 +607,33 @@ impl BlockCache {
         Some(result)
     }
 
+    /// 将数据写入缓存并标记为脏。如果该块已缓存则更新，否则新建条目。
+    pub fn put(&self, k: usize, data: Vec<u8>) {
+        let ci = {
+            let raw = k;
+            let mixed = raw ^ (raw >> 7);
+            mixed % self.width
+        };
+        let ch = &self.chains[ci];
+        // 获取链自旋锁
+        while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        let mut items = ch.items.lock().unwrap();
+        // 查找已存在的条目
+        for slot in items.iter_mut() {
+            if slot.id == k {
+                slot.payload = data;
+                slot.modified = true;
+                ch.lk.v.store(false, Ordering::Release);
+                return;
+            }
+        }
+        // 不存在，新建
+        items.push(CacheSlot { id: k, payload: data, modified: true });
+        ch.lk.v.store(false, Ordering::Release);
+    }
+
     /// 同步所有链中被修改的块（清除 modified 标记）。
     ///
     /// 在进入和退出时分别调用全局内核锁的 enter/leave，确保全局同步语义。
@@ -618,10 +642,9 @@ impl BlockCache {
     /// # 参数
     ///
     /// * `id` - 同步操作的标识符，传递给全局锁 enter
-    pub fn sync_all(&self, id: usize) {
+    pub fn sync_all(&self, id: usize, disk: &super::io::Disk) {
         eprintln!("[DBG] BlockCache::sync_all id={} nchains={}", id, self.chains.len());
         super::locking::GKL.enter(id);
-        let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
             let lk_before = ch.lk.v.load(Ordering::Relaxed);
@@ -641,8 +664,8 @@ impl BlockCache {
                 let mut items = ch.items.lock().unwrap();
                 for slot in items.iter_mut() {
                     if slot.modified {
+                        let _ = disk.write_block(slot.id, &slot.payload);
                         slot.modified = false;
-                        synced += 1;
                     }
                 }
             }

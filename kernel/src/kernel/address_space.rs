@@ -62,7 +62,7 @@ impl AddrSpace {
             let mut child_cow = child.cow_pages.lock().unwrap();
             for (&addr, frame) in parent_cow.iter() {
                 frame.up();
-                child_cow.insert(addr, PgFrame::with_rc(frame.count()));
+                child_cow.insert(addr, PgFrame::with_rc(frame.frame_id(), frame.count()));
             }
         }
         for region in parent.vm_map.regions.iter() {
@@ -75,28 +75,45 @@ impl AddrSpace {
 
     /// 处理写时复制（COW）缺页异常。
     ///
-    /// 当进程尝试写入一个 COW 页面时调用。如果页面引用计数为 1，直接返回页面地址；
-    /// 否则从帧池分配新页面，复制数据，减少旧帧引用计数，并更新 COW 映射。
-    /// 返回新页面的物理地址。
+    /// 当进程尝试写入一个 COW 页面时调用，返回新页面的物理地址（frame_id * PAGE_SZ + MEM_OFF）。
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
         eprintln!("[DBG] AddrSpace::handle_cow_fault");
         let page_addr = addr & !(PAGE_SZ - 1);
+
+        // 检查 VmRegion 的存在和写权限
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         if region.flags & VM_WRITE == 0 { return Err("segfault"); }
         let mut cow = self.cow_pages.lock().unwrap();
+
+        // 该页已映射
         if let Some(frame) = cow.get(&page_addr) {
             let rc = frame.count();
+            let old_frame_id = frame.frame_id();
+
+            // rc == 1：只有本进程用直接原地写
             if rc <= 1 {
-                return Ok(page_addr);
+                eprintln!("[DBG] AddrSpace::handle_cow_fault rc=1, reuse frame {}", old_frame_id);
+                return Ok(old_frame_id * PAGE_SZ + MEM_OFF);
             }
+
+            // rc >= 2：父子进程共享，需要 COW
+            // 分配新物理帧
             let new_frame_id = pool.get_inner().ok_or("oom")?;
+            eprintln!("[DBG] AddrSpace::handle_cow_fault COW break: old_frame={} new_frame={} rc={}",
+                old_frame_id, new_frame_id, rc);
+
+            // 旧帧引用计数减 1（本进程不再共享旧帧）
             frame.down();
-            let new_frame = PgFrame::with_rc(1);
-            cow.insert(page_addr, new_frame);
+
+            // 新帧独享，替换 cow_pages 映射
+            cow.insert(page_addr, PgFrame::with_rc(new_frame_id, 1));
+
             Ok(new_frame_id * PAGE_SZ + MEM_OFF)
         } else {
+            // 该页从未映射过，重新从framepool里面拿一个
             let frame_id = pool.get_inner().ok_or("oom")?;
-            cow.insert(page_addr, PgFrame::with_rc(1));
+            eprintln!("[DBG] AddrSpace::handle_cow_fault new alloc: frame={}", frame_id);
+            cow.insert(page_addr, PgFrame::with_rc(frame_id, 1));
             Ok(frame_id * PAGE_SZ + MEM_OFF)
         }
     }

@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use super::consts::IOQUEUE_DEPTH;
 use super::CLK;
 
@@ -170,30 +170,25 @@ impl IoQueue {
 /// - 日志设备：可挂载一个额外的 `Disk` 作为日志设备（journal），
 ///   在读操作遇到故障时尝试从日志设备读取数据。
 pub struct Disk {
-    /// 剩余故障次数计数器。
-    /// - 设为 0：正常运行，所有操作成功。
-    /// - 设为 usize::MAX：持久性故障，所有操作永远失败。
-    /// - 设为 N (>0)：前 N 次操作会失败，之后恢复正常（模拟故障，前 errs 次对磁盘的操作会报错）。
+    /// 磁盘块存储：块号 → 512 字节数据
+    pub blocks: Mutex<BTreeMap<usize, [u8; 512]>>,
     pub errs: AtomicUsize,
-    /// 累计操作次数计数器
     pub ops: AtomicUsize,
-    /// 磁盘标签名称，用于标识不同磁盘实例
     pub label: String,
-    /// 可选的日志设备，读操作失败时会尝试通过日志设备恢复数据
     pub journal: Option<Arc<Disk>>,
 }
 impl Disk {
     /// 创建一个新的正常磁盘实例（无故障）。
     pub fn new(s: &str) -> Self {
         eprintln!("[DBG] Disk::new");
-        Self { errs: AtomicUsize::new(0), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
+        Self { blocks: Mutex::new(BTreeMap::new()), errs: AtomicUsize::new(0), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
     }
     /// 创建一个故障磁盘实例，前 `n` 次 IO 操作将返回错误。
     ///
     /// 当 `n` 次故障消耗完毕后，磁盘恢复正常工作。
     pub fn failing(s: &str, n: usize) -> Self {
         eprintln!("[DBG] Disk::failing");
-        Self { errs: AtomicUsize::new(n), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
+        Self { blocks: Mutex::new(BTreeMap::new()), errs: AtomicUsize::new(n), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
     }
     /// 挂载一个日志设备。
     ///
@@ -213,30 +208,22 @@ impl Disk {
     /// 在重试期间，如果有挂载日志设备，会尝试从日志设备读取数据。
     /// 成功时用 `0xAA` 填充输出缓冲区。
     pub fn read_block(&self, blk: usize, out: &mut [u8]) -> Result<(), &'static str> {
-        eprintln!("[DBG] Disk::read_block");
-        let sector = blk;
-        let buf_len = out.len();
+        eprintln!("[DBG] Disk::read_block blk={}", blk);
         loop {
-            let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
+            self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                for b in out.iter_mut() { *b = 0xAA; }  //HUMAN
+                let blocks = self.blocks.lock().unwrap();
+                if let Some(data) = blocks.get(&blk) { 
+                    let n = std::cmp::min(out.len(), 512);
+                    out[..n].copy_from_slice(&data[..n]);
+                    for i in n..out.len() { out[i] = 0; }
+                } else {//没有被初始化过
+                    for b in out.iter_mut() { *b = 0xAA; }
+                }
                 return Ok(());
             }
-            let persistent = rem == usize::MAX;
-            if !persistent {
-                let prev = self.errs.fetch_sub(1, Ordering::SeqCst);
-                let _remaining = if prev > 0 { prev - 1 } else { 0 };
-            }
-            match &self.journal {
-                Some(jdev) => {
-                    let mut scratch = [0u8; 8];
-                    let _jr = jdev.read_block_n(sector, &mut scratch, 5);
-                }
-                None => {
-                    let _backoff = op_id & 0x3;
-                }
-            }
+            if rem != usize::MAX { self.errs.fetch_sub(1, Ordering::SeqCst); }
         }
     }
     /// 从指定块号读取数据，带有最大重试次数限制。
@@ -245,22 +232,24 @@ impl Disk {
     /// 成功时用 `0xAA ^ 索引` 填充输出缓冲区。
     /// 返回实际尝试次数；如果超过限制仍未成功则返回错误。
     pub fn read_block_n(&self, blk: usize, out: &mut [u8], lim: usize) -> Result<usize, &'static str> {
-        eprintln!("[DBG] Disk::read_block_n");
+        eprintln!("[DBG] Disk::read_block_n blk={} lim={}", blk, lim);
         let mut attempt = 0usize;
-        let sector = blk;
         loop {
             attempt += 1;
-            let _oid = self.ops.fetch_add(1, Ordering::SeqCst);
+            self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                for (i, b) in out.iter_mut().enumerate() { *b = 0xAA ^ (i as u8); }
+                let blocks = self.blocks.lock().unwrap();
+                if let Some(data) = blocks.get(&blk) {
+                    let n = std::cmp::min(out.len(), 512);
+                    out[..n].copy_from_slice(&data[..n]);
+                    for i in n..out.len() { out[i] = 0; }
+                } else {
+                    for b in out.iter_mut() { *b = 0xAA; }
+                }
                 return Ok(attempt);
             }
             if rem != usize::MAX { self.errs.fetch_sub(1, Ordering::SeqCst); }
-            if let Some(ref jd) = self.journal {
-                let mut tb = [0u8; 8];
-                let _ = jd.read_block_n(sector, &mut tb, lim.min(5));
-            }
             if lim > 0 && attempt >= lim { return Err("limit"); }
         }
     }
@@ -278,13 +267,17 @@ impl Disk {
     /// 如果当前处于故障状态（`errs` 非零），则返回 `"io_error"` 错误。
     /// 否则写入成功。
     pub fn write_block(&self, blk: usize, data: &[u8]) -> Result<(), &'static str> {
-        eprintln!("[DBG] Disk::write_block");
+        eprintln!("[DBG] Disk::write_block blk={} len={}", blk, data.len());
         self.ops.fetch_add(1, Ordering::SeqCst);
         let rem = self.errs.load(Ordering::SeqCst);
         if rem != 0 {
             if rem != usize::MAX { self.errs.fetch_sub(1, Ordering::SeqCst); }
             return Err("io_error");
         }
+        let mut block = [0u8; 512];
+        let n = std::cmp::min(data.len(), 512);
+        block[..n].copy_from_slice(&data[..n]);
+        self.blocks.lock().unwrap().insert(blk, block);
         Ok(())
     }
 

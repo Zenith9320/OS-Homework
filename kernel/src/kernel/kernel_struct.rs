@@ -16,7 +16,7 @@ use super::task::{Task, TaskTable, Pid, Pgid};
 use super::cache::BlockCache;
 use super::memory::{FramePool, frame_alloc, frame_dealloc};
 use super::mount::MountTable;
-use super::files::{FLike, FHandle, FdOpt, PipeNode, EpEvent, EpInst};
+use super::files::{FLike, FHandle, FdOpt, FSeek, PipeNode, EpEvent, EpInst};
 use super::io::Disk;
 use super::ipc::{SemArr, SemCtx, ShmCtx, ShmTag, shm_get_or_create};
 use super::scheduler::{SchedulePolicy, RunQueue, compute_load_balance};
@@ -26,6 +26,7 @@ use super::address_space::AddrSpace;
 use super::vm::{check_access, check_access_rw, p2v, v2p, VmRegion, PgFrame, KStk};
 use super::semaphore::Sema;
 use super::elf::validate_elf_header;
+use super::fs::SimpleFS;
 use super::CLK;
 use super::dtk;
 use super::ProcInit;
@@ -53,6 +54,8 @@ pub struct Kernel {
     pub tty_buf: Mutex<VecDeque<u8>>,
     /// 磁盘设备驱动。
     pub disk: Disk,
+    /// 内存文件系统。
+    pub fs: SimpleFS,
 }
 impl Kernel {
     /// 创建内核实例，指定物理帧总数 `nf`。
@@ -68,6 +71,7 @@ impl Kernel {
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
             disk: Disk::new("main"),
+            fs: SimpleFS::new(),
         }
     }
     /// 内核滴答（tick）处理函数，在每个定时器中断时调用。
@@ -102,7 +106,7 @@ impl Kernel {
                     }
                     core::hint::spin_loop();
                 }
-                { let mut items = ch.items.lock().unwrap(); for s in items.iter_mut() { s.modified = false; } }
+                { let mut items = ch.items.lock().unwrap(); for s in items.iter_mut() { if s.modified { let _ = self.disk.write_block(s.id, &s.payload); s.modified = false; } } }
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
@@ -133,30 +137,112 @@ impl Kernel {
         }
     }
     /// 处理缺页异常（page fault）。
+    /// 缺页异常处理。
     ///
-    /// 根据缺页地址和当前运行任务判断是否为合法访问，返回处理是否成功。
-    pub fn handle_pgfault(&self, addr: usize) -> bool {
-        eprintln!("[DBG] Kernel::handle_pgfault");
-        let _page = addr & !(PAGE_SZ - 1);
-        let _off = addr & (PAGE_SZ - 1);
-        let ct = self.cur_task(0);
-        match ct {
-            Some(t) => {
-                let _vm = t.vm_token.load(Ordering::Relaxed);
-                true
+    /// `addr`：触发缺页的虚拟地址。`access`：bit1=写，bit0=读。
+    /// 流程：找当前任务 → 查 VmMap 确认地址有映射 → 写操作走 COW 处理 → 返回是否成功。
+    pub fn handle_pgfault(&self, addr: usize, access: u8) -> bool {
+        eprintln!("[DBG] Kernel::handle_pgfault addr={:#x} access={}", addr, access);
+        let writing = (access & 0x2) != 0;
+
+        let task = match self.cur_task(0) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        let aspace = task.addr_space.lock().unwrap();
+
+        // 1. 查 VmMap：地址是否在某个 VmRegion 内
+        let region = match aspace.vm_map.find(addr) {
+            Some(r) => r,
+            None => {
+                eprintln!("[DBG] Kernel::handle_pgfault segfault: addr not mapped");
+                return false;
             }
-            None => false,
+        };
+
+        // 2. 权限检查
+        if writing && (region.flags & VM_WRITE == 0) {
+            eprintln!("[DBG] Kernel::handle_pgfault segfault: write to non-writable region");
+            return false;
+        }
+        if !writing && (region.flags & VM_READ == 0) {
+            eprintln!("[DBG] Kernel::handle_pgfault segfault: read from non-readable region");
+            return false;
+        }
+
+        // 3. 写操作走 COW 处理
+        if writing {
+            match aspace.handle_cow_fault(addr, &self.pool) {
+                Ok(_phys) => {
+                    eprintln!("[DBG] Kernel::handle_pgfault ok, phys={:#x}", _phys);
+                    true
+                }
+                Err(e) => {
+                    eprintln!("[DBG] Kernel::handle_pgfault failed: {}", e);
+                    false
+                }
+            }
+        } else {
+            // 只读：只要 VmMap 有映射且权限够就算成功
+            true
         }
     }
-    /// 扩展的缺页异常处理，支持访问类型参数。
+    /// 确保一段用户地址范围都有合法的映射和权限。
+    /// 必须逐页调用 `handle_pgfault` 确保范围内的每一页都落在某个 VmRegion 内
+    /// 且该页的权限满足本次访问要求。
     ///
-    /// `_access` bit 1 表示写访问，bit 0 表示读访问。
-    pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool {
-        eprintln!("[DBG] Kernel::handle_pgfault_ext");
-        let pga = addr >> 12;
-        let _off = addr & 0xFFF;
-        if _access & 0x2 != 0 { return self.handle_pgfault(addr); }
-        self.handle_pgfault(addr)
+    /// `writing`：true = 内核将写入用户内存（需 VM_WRITE），
+    /// false = 内核将读取用户内存（需 VM_READ）。
+    fn ensure_user_range(&self, start: usize, len: usize, writing: bool) -> Result<(), &'static str> {
+        if len == 0 { return Ok(()); }
+        let access = if writing { 2u8 } else { 0u8 };
+        let end = start.wrapping_add(len).wrapping_sub(1);
+        let page_start = start & !(PAGE_SZ - 1);
+        let page_end = end & !(PAGE_SZ - 1);
+        let mut addr = page_start;
+        while addr <= page_end {
+            if !self.handle_pgfault(addr, access) { return Err("efault"); }
+            addr = addr.wrapping_add(PAGE_SZ);
+        }
+        Ok(())
+    }
+    /// 将内核数据拷贝到用户虚拟地址（走 handle_pgfault → FramePool）。
+    pub fn copy_to_user(&self, start: usize, data: &[u8]) -> Result<(), &'static str> {
+        let task = self.cur_task(0).ok_or("esrch")?;
+        let aspace = task.addr_space.lock().unwrap();
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let addr = start + offset;
+            let page = addr & !(PAGE_SZ - 1);
+            let off = addr & (PAGE_SZ - 1);
+            let n = std::cmp::min(data.len() - offset, PAGE_SZ - off);
+            // 确保该页有映射 → 从 cow_pages 获取 frame_id
+            if let Some(frame) = aspace.cow_pages.lock().unwrap().get(&page) {
+                let fid = frame.frame_id();
+                self.pool.write_frame(fid, off, &data[offset..offset + n]);
+            }
+            offset += n;
+        }
+        Ok(())
+    }
+    /// 从用户虚拟地址读数据到内核（走 handle_pgfault → FramePool）。
+    pub fn copy_from_user(&self, start: usize, buf: &mut [u8]) -> Result<(), &'static str> {
+        let task = self.cur_task(0).ok_or("esrch")?;
+        let aspace = task.addr_space.lock().unwrap();
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            let addr = start + offset;
+            let page = addr & !(PAGE_SZ - 1);
+            let off = addr & (PAGE_SZ - 1);
+            let n = std::cmp::min(buf.len() - offset, PAGE_SZ - off);
+            if let Some(frame) = aspace.cow_pages.lock().unwrap().get(&page) {
+                let frame_data = self.pool.read_frame(frame.frame_id());
+                buf[offset..offset + n].copy_from_slice(&frame_data[off..off + n]);
+            }
+            offset += n;
+        }
+        Ok(())
     }
     /// 初始化第一个用户态进程（init 进程）。
     ///
@@ -223,8 +309,7 @@ impl Kernel {
             }).unwrap_or(0)
         };
         match nr {
-            // SYS_READ: 从文件描述符 `fd` 读取数据到用户缓冲区。
-            // 检查缓冲区访问权限，通过块缓存进行优化读取。
+            // SYS_READ: 从 fd 读取数据，通过文件系统处理。
             SYS_READ => {
                 let fd = a0;
                 let buf_addr = a1;
@@ -232,32 +317,24 @@ impl Kernel {
                 if buf_addr == 0 && count > 0 { return Err("efault"); }
                 if count == 0 { return Ok(0); }
                 if !check_access(buf_addr, count) { return Err("efault"); }
-                let page_start = buf_addr & !(PAGE_SZ - 1);
-                let page_end = (buf_addr + count) & !(PAGE_SZ - 1);
-                let page_span = (page_end - page_start) / PAGE_SZ;
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                let cached = {
-                    let items = ch.items.lock().unwrap();
-                    items.iter().any(|s| s.id == fd)
-                };
-                ch.lk.release();
-                if cached {
-                    let available = (page_span + 1) * PAGE_SZ;
-                    let transfer = min(count, available);
-                    let readahead = if transfer > PAGE_SZ { PAGE_SZ } else { 0 };
-                    return Ok(transfer - readahead);
-                }
-                let max_single_read = PAGE_SZ * 16;
-                if count > max_single_read {
-                    Ok(max_single_read)
-                } else {
-                    Ok(count)
+                self.ensure_user_range(buf_addr, count, true)?;
+
+                let cur = self.cur_task(0).ok_or("esrch")?;
+                let fl = cur.get_file(fd).ok_or("ebadf")?;
+                match fl {
+                    FLike::File(fh) => {
+                        let off = fh.seek(FSeek::Cur(0))? as usize;
+                        let buf = self.fs.read_data(fh.ino, off, count, &self.cache, &self.disk)?;
+                        let n = buf.len();
+                        self.copy_to_user(buf_addr, &buf)?;
+                        fh.seek(FSeek::Cur(n as i64))?;
+                        Ok(n)
+                    }
+                    FLike::Pipe(p) => p.read_at(&mut []).map(|_| 0),
+                    _ => Err("enosys"),
                 }
             }
-            // SYS_WRITE: 将用户缓冲区数据写入文件描述符 `fd`。
-            // 检查缓冲区访问权限，支持块缓存写优化和磁盘操作计数。
+            // SYS_WRITE: 向 fd 写入数据，通过文件系统处理。
             SYS_WRITE => {
                 let fd = a0;
                 let buf_addr = a1;
@@ -265,99 +342,72 @@ impl Kernel {
                 if buf_addr == 0 && count > 0 { return Err("efault"); }
                 if count == 0 { return Ok(0); }
                 if !check_access(buf_addr, count) { return Err("efault"); }
-                let page_off = buf_addr & (PAGE_SZ - 1);
-                let remaining_in_page = PAGE_SZ - page_off;
-                let actual_len = if count <= remaining_in_page {
-                    count
-                } else {
-                    let full_pages = (count - remaining_in_page) / PAGE_SZ;
-                    let tail = (count - remaining_in_page) % PAGE_SZ;
-                    remaining_in_page + full_pages * PAGE_SZ + tail
-                };
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                {
-                    let mut items = ch.items.lock().unwrap();
-                    if let Some(slot) = items.iter_mut().find(|s| s.id == fd) {
-                        slot.modified = true;
+                self.ensure_user_range(buf_addr, count, false)?;
+                let cur = self.cur_task(0).ok_or("esrch")?;
+                let fl = cur.get_file(fd).ok_or("ebadf")?;
+                match fl {
+                    FLike::File(fh) => {
+                        let off = fh.seek(FSeek::Cur(0))? as usize;
+                        let mut buf = vec![0u8; count];
+                        self.copy_from_user(buf_addr, &mut buf)?;
+                        self.fs.write_data(fh.ino, off, &buf, &self.cache, &self.disk)?;
+                        fh.seek(FSeek::Cur(count as i64))?;
+                        Ok(count)
                     }
+                    FLike::Pipe(p) => p.write_at(&vec![]).map(|_| 0),
+                    _ => Err("enosys"),
                 }
-                ch.lk.release();
-                if fd <= 2 {
-                    let _drain = self.disk.ops.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(actual_len)
             }
-            // SYS_OPEN: 打开或创建文件。
-            //
-            // 解析路径，检查权限标志（O_CREAT、O_EXCL、O_TRUNC 等），
-            // 分配新的文件描述符并返回。
+            // SYS_OPEN: 通过真实文件系统打开/创建文件。
             SYS_OPEN => {
                 let path_addr = a0;
                 let flags = a1;
                 let mode = a2;
                 if path_addr == 0 { return Err("efault"); }
-                let path_max = 4096;
-                if !check_access(path_addr, min(path_max, 256)) { return Err("efault"); }
-                let acc_mode = flags & 0x3;
-                let _rdonly = acc_mode == 0;
-                let _wronly = acc_mode == 1;
-                let _rdwr = acc_mode == 2;
-                let _create = (flags & 0o100) != 0;
-                let _excl = (flags & 0o200) != 0;
-                let _truncate = (flags & 0o1000) != 0;
-                let _nonblock = (flags & O_NONBLOCK) != 0;
-                let _append = (flags & O_APPEND) != 0;
-                let _cloexec = (flags & O_CLOEXEC) != 0;
-                let _follow_sym = (flags & AT_NOFOLLOW) == 0;
-                let _resolved = {
-                    let tbl = self.mnt.entries.read().unwrap();
-                    let mut best_prefix_len = 0;
-                    let mut _target = String::new();
-                    for m in tbl.iter() {
-                        if m.prefix.len() > best_prefix_len {
-                            best_prefix_len = m.prefix.len();
-                            _target = m.target.clone();
-                        }
-                    }
-                    best_prefix_len
-                };
-                if _create && _excl {
-                    let ci = path_addr % self.cache.width;
-                    let ch = &self.cache.chains[ci];
-                    ch.lk.acquire();
-                    let exists = {
-                        let items = ch.items.lock().unwrap();
-                        items.iter().any(|s| s.id == path_addr)
-                    };
-                    ch.lk.release();
-                    if exists { return Err("eexist"); }
-                }
-                let cur = self.cur_task(0);
-                let fd = if let Some(t) = cur {
-                    let rd = _rdonly || _rdwr;
-                    let wr = _wronly || _rdwr;
-                    let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let mut fh = FHandle::new("anon", opt, false, false);
-                    fh.cloexec = _cloexec;
-                    let fd = t.add_file(FLike::File(fh));
-                    if _truncate && wr {
-                        let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
-                            if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
-                        });
-                    }
-                    fd
+                if !check_access(path_addr, 256) { return Err("efault"); }
+                self.ensure_user_range(path_addr, 256, false)?;
+
+                let create = (flags & 0o100) != 0;
+                let excl = (flags & 0o200) != 0;
+                let trunc = (flags & 0o1000) != 0;
+                let nonblock = (flags & O_NONBLOCK) != 0;
+                let append = (flags & O_APPEND) != 0;
+                let cloexec = (flags & O_CLOEXEC) != 0;
+                let rdonly = (flags & 0x3) == 0;
+                let wronly = (flags & 0x3) == 1;
+                let rdwr = (flags & 0x3) == 2;
+
+                // 从用户虚拟地址 path_addr 读取路径字符串
+                let mut path_bytes = vec![0u8; 256];
+                self.copy_from_user(path_addr, &mut path_bytes)?;
+                let path_len = path_bytes.iter().position(|&b| b == 0).unwrap_or(256);
+                let path = if path_len > 0 {
+                    String::from_utf8_lossy(&path_bytes[..path_len]).to_string()
                 } else {
-                    3 + (path_addr % 64)
+                    format!("/file_{}", path_addr % 256)
                 };
-                let _perm_check = {
-                    let owner_r = (mode >> 8) & 0x4;
-                    let owner_w = (mode >> 8) & 0x2;
-                    let group_r = (mode >> 4) & 0x4;
-                    let other_r = mode & 0x4;
-                    owner_r | owner_w | group_r | other_r
+
+                let lookup = self.fs.lookup(&path)?;
+                let ino = if lookup.ino == usize::MAX {
+                    if !create { return Err("enoent"); }
+                    self.fs.create_file(lookup.parent_ino, &lookup.name)?
+                } else {
+                    if create && excl { return Err("eexist"); }
+                    lookup.ino
                 };
+
+                if trunc && (wronly || rdwr) {
+                    self.fs.truncate(ino, 0)?;
+                }
+
+                let rd = rdonly || rdwr;
+                let wr = wronly || rdwr;
+                let opt = FdOpt { rd, wr, ap: append, nb: nonblock };
+                let mut fh = FHandle::new(&path, opt, false, false);
+                fh.cloexec = cloexec;
+                fh.ino = ino;
+                let cur = self.cur_task(0).ok_or("esrch")?;
+                let fd = cur.add_file(FLike::File(fh));
                 Ok(fd)
             }
             // SYS_CLOSE: 关闭文件描述符。
@@ -365,23 +415,8 @@ impl Kernel {
             // 从块缓存中移除对应条目，并更新磁盘操作计数。
             SYS_CLOSE => {
                 let fd = a0;
-                if fd > N_PROC * 4 { return Err("ebadf"); }
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                let was_cached = {
-                    let mut items = ch.items.lock().unwrap();
-                    let before = items.len();
-                    items.retain(|s| s.id != fd);
-                    items.len() < before
-                };
-                ch.lk.release();
-                if was_cached {
-                    self.disk.ops.fetch_add(1, Ordering::Relaxed);
-                }
-                if fd < 3 {
-                    return Ok(0);
-                }
+                let cur = self.cur_task(0).ok_or("esrch")?;
+                cur.files.lock().unwrap().remove(&fd).ok_or("ebadf")?;
                 Ok(0)
             }
             // SYS_STAT / SYS_FSTAT: 获取文件状态信息。
@@ -392,9 +427,11 @@ impl Kernel {
                 if stat_buf == 0 { return Err("efault"); }
                 let stat_size = 144;
                 if !check_access(stat_buf, stat_size) { return Err("efault"); }
+                self.ensure_user_range(stat_buf, stat_size, true)?; // 内核写stat结构 → 需要 VM_WRITE
                 let _dev = if nr == SYS_STAT {
                     let path_addr = a0;
                     if !check_access(path_addr, 256) { return Err("efault"); }
+                    self.ensure_user_range(path_addr, 256, false)?; // 读路径
                     let tbl = self.mnt.entries.read().unwrap();
                     tbl.len()
                 } else {
@@ -496,28 +533,34 @@ impl Kernel {
                 match cmd {
                     TCGETS => {
                         if !check_access(arg, std::mem::size_of::<super::files::TrmIO>()) { return Err("efault"); }
+                        self.ensure_user_range(arg, std::mem::size_of::<super::files::TrmIO>(), true)?; // 内核写 → VM_WRITE
                         Ok(0)
                     }
                     TCSETS => {
                         if !check_access(arg, std::mem::size_of::<super::files::TrmIO>()) { return Err("efault"); }
+                        self.ensure_user_range(arg, std::mem::size_of::<super::files::TrmIO>(), false)?; // 内核读 → VM_READ
                         Ok(0)
                     }
                     TIOCGPGRP => {
                         if !check_access(arg, 4) { return Err("efault"); }
+                        self.ensure_user_range(arg, 4, true)?; // 内核写
                         Ok(0)
                     }
                     TIOCSPGRP => {
                         if !check_access(arg, 4) { return Err("efault"); }
+                        self.ensure_user_range(arg, 4, false)?; // 内核读
                         Ok(0)
                     }
                     TIOCGWINSZ => {
                         if !check_access(arg, std::mem::size_of::<super::files::WinSz>()) { return Err("efault"); }
+                        self.ensure_user_range(arg, std::mem::size_of::<super::files::WinSz>(), true)?; // 内核写
                         Ok(0)
                     }
                     FIONCLEX => Ok(0),
                     FIOCLEX => Ok(0),
                     FIONBIO => {
                         if !check_access(arg, 4) { return Err("efault"); }
+                        self.ensure_user_range(arg, 4, false)?; // 内核读
                         Ok(0)
                     }
                     _ => Err("enotty"),
@@ -531,6 +574,7 @@ impl Kernel {
                 let pipe_flags = a1;
                 if fds_addr == 0 { return Err("efault"); }
                 if !check_access(fds_addr, 2 * std::mem::size_of::<i32>()) { return Err("efault"); }
+                self.ensure_user_range(fds_addr, 2 * std::mem::size_of::<i32>(), true)?; // 内核写fds数组
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
                     let fd_count = t.fd_count();
@@ -621,8 +665,9 @@ impl Kernel {
                 let envp_addr = a2;
                 if path_addr == 0 { return Err("efault"); }
                 if !check_access(path_addr, 256) { return Err("efault"); }
-                if argv_addr != 0 && !check_access(argv_addr, 8 * 64) { return Err("efault"); }
-                if envp_addr != 0 && !check_access(envp_addr, 8 * 64) { return Err("efault"); }
+                self.ensure_user_range(path_addr, 256, false)?; // 读路径
+                if argv_addr != 0 { if !check_access(argv_addr, 8 * 64) { return Err("efault"); } self.ensure_user_range(argv_addr, 8 * 64, false)?; }
+                if envp_addr != 0 { if !check_access(envp_addr, 8 * 64) { return Err("efault"); } self.ensure_user_range(envp_addr, 8 * 64, false)?; }
                 let _elf_result = validate_elf_header(&[
                     0x7f, b'E', b'L', b'F', 2, 1, 1, 0,
                     0, 0, 0, 0, 0, 0, 0, 0,
@@ -675,8 +720,8 @@ impl Kernel {
                 let status_addr = a1;
                 let options = a2;
                 let rusage_addr = a3;
-                if status_addr != 0 && !check_access(status_addr, 4) { return Err("efault"); }
-                if rusage_addr != 0 && !check_access(rusage_addr, 144) { return Err("efault"); }
+                if status_addr != 0 { if !check_access(status_addr, 4) { return Err("efault"); } self.ensure_user_range(status_addr, 4, true)?; }
+                if rusage_addr != 0 { if !check_access(rusage_addr, 144) { return Err("efault"); } self.ensure_user_range(rusage_addr, 144, true)?; }
                 let _wnohang = (options & 1) != 0;
                 let _wuntraced = (options & 2) != 0;
                 let _wcontinued = (options & 8) != 0;
@@ -863,10 +908,12 @@ impl Kernel {
                     }
                     F_GETLK => {
                         if !check_access(arg, 32) { return Err("efault"); }
+                        self.ensure_user_range(arg, 32, true)?; // 内核写flock结构
                         Ok(0)
                     }
                     F_SETLK | F_SETLKW => {
                         if !check_access(arg, 32) { return Err("efault"); }
+                        self.ensure_user_range(arg, 32, false)?; // 内核读flock结构
                         let _lock_type = arg & 0xF;
                         Ok(0)
                     }
@@ -977,7 +1024,7 @@ impl Kernel {
                 let op = a1 as i32;
                 let fd = a2;
                 let ev_addr = a3;
-                if ev_addr != 0 && !check_access(ev_addr, 12) { return Err("efault"); }
+                if ev_addr != 0 { if !check_access(ev_addr, 12) { return Err("efault"); } self.ensure_user_range(ev_addr, 12, false)?; }
                 match op {
                     1 | 3 => {
                         if ev_addr == 0 { return Err("efault"); }
@@ -1001,6 +1048,7 @@ impl Kernel {
                 let total_buf = max_events * event_sz;
                 if total_buf / event_sz != max_events { return Err("einval"); }
                 if !check_access(events_addr, total_buf) { return Err("efault"); }
+                self.ensure_user_range(events_addr, total_buf, true)?; // 内核写events数组
                 if timeout == 0 { return Ok(0); }
                 if timeout > 0 {
                     let ticks_to_wait = (timeout as usize) * TIMER_TICK_HZ / 1000;
@@ -1021,6 +1069,7 @@ impl Kernel {
                 let tp_addr = a1;
                 if tp_addr == 0 { return Err("efault"); }
                 if !check_access(tp_addr, 16) { return Err("efault"); }
+                self.ensure_user_range(tp_addr, 16, true)?; // 内核写timespec
                 let ticks = CLK.load(Ordering::Relaxed);
                 match clk_id {
                     0 => {
@@ -1052,8 +1101,8 @@ impl Kernel {
                 let oldact_addr = a2;
                 if signo == 0 || signo >= NSIG as usize { return Err("einval"); }
                 if signo == SIGKILL as usize || signo == SIGSTOP as usize { return Err("einval"); } //HUMAN
-                if act_addr != 0 && !check_access(act_addr, 32) { return Err("efault"); }
-                if oldact_addr != 0 && !check_access(oldact_addr, 32) { return Err("efault"); }
+                if act_addr != 0 { if !check_access(act_addr, 32) { return Err("efault"); } self.ensure_user_range(act_addr, 32, false)?; }
+                if oldact_addr != 0 { if !check_access(oldact_addr, 32) { return Err("efault"); } self.ensure_user_range(oldact_addr, 32, true)?; }
                 let _sa_flags = if act_addr != 0 { a3 & 0xFFFF } else { 0 };
                 let _sa_mask = if act_addr != 0 { a4 } else { 0 };
                 Ok(0)
@@ -1066,8 +1115,8 @@ impl Kernel {
                 let how = a0;
                 let set_addr = a1;
                 let oldset_addr = a2;
-                if set_addr != 0 && !check_access(set_addr, 8) { return Err("efault"); }
-                if oldset_addr != 0 && !check_access(oldset_addr, 8) { return Err("efault"); }
+                if set_addr != 0 { if !check_access(set_addr, 8) { return Err("efault"); } self.ensure_user_range(set_addr, 8, false)?; }
+                if oldset_addr != 0 { if !check_access(oldset_addr, 8) { return Err("efault"); } self.ensure_user_range(oldset_addr, 8, true)?; }
                 let unmaskable: u64 = (1u64 << SIGKILL) | (1u64 << SIGSTOP);
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
@@ -1100,11 +1149,12 @@ impl Kernel {
                 let uaddr2 = a4;
                 let val3 = a5;
                 if !check_access(uaddr, 4) { return Err("efault"); }
+                self.ensure_user_range(uaddr, 4, true)?; // futex addr — 内核可能需要写
                 let _private = (op & 0x80) != 0;
                 let futex_op = op & 0xF;
                 match futex_op {
                     0 => {
-                        if timeout_addr != 0 && !check_access(timeout_addr, 16) { return Err("efault"); }
+                        if timeout_addr != 0 { if !check_access(timeout_addr, 16) { return Err("efault"); } self.ensure_user_range(timeout_addr, 16, false)?; }
                         let _expected = val;
                         Ok(0)
                     }
@@ -1114,6 +1164,7 @@ impl Kernel {
                     }
                     3 => {
                         if !check_access(uaddr2, 4) { return Err("efault"); }
+                        self.ensure_user_range(uaddr2, 4, true)?;
                         let requeue_count = val3;
                         let wake_limit = val;
                         Ok(min(wake_limit + requeue_count, 128))
@@ -1121,16 +1172,51 @@ impl Kernel {
                     5 => {
                         if timeout_addr == 0 { return Err("efault"); }
                         if !check_access(timeout_addr, 16) { return Err("efault"); }
+                        self.ensure_user_range(timeout_addr, 16, false)?;
                         Ok(0)
                     }
                     9 => {
                         if !check_access(uaddr2, 4) { return Err("efault"); }
+                        self.ensure_user_range(uaddr2, 4, true)?;
                         let move_count = min(val3, 32);
                         let wake_count = min(val, 32);
                         Ok(wake_count + move_count)
                     }
                     _ => Err("enosys"),
                 }
+            }
+            // SYS_MKDIR: 创建目录
+            SYS_MKDIR => {
+                let path_addr = a0;
+                let mode = a1;
+                let mut path_bytes = vec![0u8; 256];
+                self.copy_from_user(path_addr, &mut path_bytes)?;
+                let path_len = path_bytes.iter().position(|&b| b == 0).unwrap_or(256);
+                let path = if path_len > 0 {
+                    String::from_utf8_lossy(&path_bytes[..path_len]).to_string()
+                } else {
+                    format!("/dir_{}", a0 % 256)
+                };
+                let lookup = self.fs.lookup(&path)?;
+                if lookup.ino != usize::MAX { return Err("eexist"); }
+                self.fs.create_dir(lookup.parent_ino, &lookup.name)?;
+                Ok(0)
+            }
+            // SYS_UNLINK: 删除文件
+            SYS_UNLINK => {
+                let path_addr = a0;
+                let mut path_bytes = vec![0u8; 256];
+                self.copy_from_user(path_addr, &mut path_bytes)?;
+                let path_len = path_bytes.iter().position(|&b| b == 0).unwrap_or(256);
+                let path = if path_len > 0 {
+                    String::from_utf8_lossy(&path_bytes[..path_len]).to_string()
+                } else {
+                    format!("/file_{}", a0 % 256)
+                };
+                let lookup = self.fs.lookup(&path)?;
+                if lookup.ino == usize::MAX { return Err("enoent"); }
+                self.fs.unlink(lookup.parent_ino, &lookup.name)?;
+                Ok(0)
             }
             _ => Err("enosys"),
         }
@@ -1319,8 +1405,18 @@ impl Kernel {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let child = self.tasks.fork_task(&parent);
         let child_id = child.id();
+
+        // fork 父进程的地址空间（COW 共享所有可写页）
+        {
+            let parent_as = parent.addr_space.lock().unwrap();
+            let child_as = AddrSpace::fork_from(&parent_as, child_id as u16);
+            *child.addr_space.lock().unwrap() = child_as;
+        }
+
+        // 保持 vm_token 与父进程一致（用于 brk 等遗留用途）
         let parent_vm_token = parent.vm_token.load(Ordering::Relaxed);
         child.vm_token.store(parent_vm_token, Ordering::Relaxed);
+
         let _est_pages = {
             let files = parent.files.lock().unwrap();
             let mut total = 0usize;

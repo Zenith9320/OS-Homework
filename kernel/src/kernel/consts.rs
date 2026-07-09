@@ -337,6 +337,14 @@ pub const SYS_SIGACTION: usize = 13;
 pub const SYS_SIGPROCMASK: usize = 14;
 /// sys_futex: 快速用户态互斥锁操作。
 pub const SYS_FUTEX: usize = 202;
+/// sys_mkdir: 创建目录。
+pub const SYS_MKDIR: usize = 83;
+/// sys_unlink: 删除文件。
+pub const SYS_UNLINK: usize = 87;
+/// sys_truncate: 截断文件。
+pub const SYS_TRUNCATE: usize = 92;
+/// sys_getdents: 读取目录项。
+pub const SYS_GETDENTS: usize = 217;
 
 /// IO 队列最大深度。
 pub const IOQUEUE_DEPTH: usize = 128;

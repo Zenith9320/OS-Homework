@@ -26,7 +26,7 @@ fn basic_fork_exec_workload() {
     }
     assert_eq!(frames.len(), 4);
 
-    let src = PgFrame::with_rc(2);
+    let src = PgFrame::with_rc(0, 2);
     let sp = SharedPage::new(frames[0]);
     let cow_result = sp.fault(&kern.pool, &src);
     assert!(cow_result.is_ok());
@@ -88,7 +88,7 @@ fn basic_mmap_file_io_workload() {
     assert!(check_access(0x1000, 0x2000));
 
     let f = pool.get_inner().unwrap();
-    let src = PgFrame::with_rc(2);
+    let src = PgFrame::with_rc(0, 2);
     let sp = SharedPage::new(f);
     let nf = sp.fault(&pool, &src);
     assert!(nf.is_ok());

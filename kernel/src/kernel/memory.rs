@@ -4,7 +4,7 @@
 
 use std::sync::{Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::cmp::min;
 use super::consts::*;
 use super::vm::PgFrame;
@@ -237,7 +237,6 @@ impl SlabEntry {
             let candidate = slot + self.obj_size;
             if candidate > self.data.len() { self.data.len() } else { candidate }
         };
-        let needs_init = zeroed | false;
         if zeroed { //HUMAN: 如果zeroed说明不用init
             let region = &mut self.data[slot..obj_end];
             let mut pos = 0;
@@ -313,18 +312,31 @@ impl SlabEntry {
 /// 物理帧池（FramePool），管理一组物理页帧的分配与回收。
 /// 使用互斥锁保护的位图（Vec<bool>）标记每个帧的空闲状态。
 pub struct FramePool {
-    /// 帧位图，true 表示空闲，false 表示已分配。由 Mutex 保护以支持并发访问。
+    /// 帧位图，true 表示空闲，false 表示已分配。
     pub slots: Mutex<Vec<bool>>,
     /// 帧池中页帧的总数量。
     pub cap: usize,
+    /// 帧的实际数据：帧号 → 4096 字节。
+    pub frame_data: Mutex<BTreeMap<usize, [u8; 4096]>>,
 }
 
 impl FramePool {
-    /// 创建包含 `n` 个初始空闲帧的帧池。
-    /// `n`：帧数量。
     pub fn new(n: usize) -> Self {
         eprintln!("[DBG] FramePool::new");
-        Self { slots: Mutex::new(vec![true; n]), cap: n }
+        Self { slots: Mutex::new(vec![true; n]), cap: n, frame_data: Mutex::new(BTreeMap::new()) }
+    }
+
+    /// 读帧数据。
+    pub fn read_frame(&self, frame_id: usize) -> [u8; 4096] {
+        self.frame_data.lock().unwrap().get(&frame_id).copied().unwrap_or([0u8; 4096])
+    }
+
+    /// 写帧数据。
+    pub fn write_frame(&self, frame_id: usize, offset: usize, data: &[u8]) {
+        let mut fd = self.frame_data.lock().unwrap();
+        let entry = fd.entry(frame_id).or_insert([0u8; 4096]);
+        let n = std::cmp::min(data.len(), 4096 - offset);
+        entry[offset..offset + n].copy_from_slice(&data[..n]);
     }
 
     /// 分配一个空闲帧。先获取 GKL 锁（由调用者管理），然后执行内部分配逻辑。
@@ -332,7 +344,6 @@ impl FramePool {
     /// 返回分配的帧索引，若无空闲帧则返回 None。
     pub fn get(&self, id: usize) -> Option<usize> {
         eprintln!("[DBG] FramePool::get");
-        // BUGFIX: GKL由调用者管理，FramePool内部不重复获取。
         // 如果这里调用GKL.enter(id)，会与调用者已经持有的GKL产生id不匹配的死锁。
         //HUMAN: GKL.enter(id);
         let r = self.get_inner();
